@@ -11,7 +11,7 @@ The core principle remains the same: hijacking the `fetch` function in an AI Stu
 The system is designed with a clear separation of concerns:
 
 -   **Backend (Python/FastAPI):** Acts as a high-performance API gateway. It simulates the entire Gemini REST API, handles client requests, manages a pool of frontend executors, performs load balancing, and formats responses.
--   **Frontend (React/Vite):** A lightweight execution client that runs in a browser tab on Google AI Studio. It listens for tasks from the backend via WebSocket, executes them using the `@google/generative-ai` SDK, and streams the results back.
+-   **Frontend (React/Vite):** A lightweight execution client that runs in a browser tab on Google AI Studio. It listens for tasks from the backend via WebSocket, executes them using the `@google/genai` SDK, and streams the results back.
 
 For a detailed breakdown, see [`docs/REFACTOR_PLAN.md`](./docs/REFACTOR_PLAN.md).
 

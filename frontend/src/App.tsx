@@ -43,7 +43,7 @@ function App() {
   }, []); // Empty dependency array ensures this runs only once on mount
 
   // Format logs for display
-  const formattedLogs = logs.map((log: LogEntry, index: number) => 
+  const formattedLogs = logs.map((log: LogEntry) => 
     `${log.timestamp.toLocaleTimeString()} [${log.level.toUpperCase()}] ${log.message}`
   );
 
