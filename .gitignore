@@ -1,0 +1,80 @@
+# ===================================================================
+# General & OS-specific
+# ===================================================================
+
+# Operating System generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE and editor configuration files
+.idea/
+.vscode/
+*.swp
+*~
+
+# ===================================================================
+# Python / Conda / FastAPI Backend (in backend/)
+# ===================================================================
+
+# Environment files - **DO NOT COMMIT SECRETS**
+backend/.env
+
+# Python virtual environments
+backend/.venv
+backend/venv/
+backend/env/
+
+# Python bytecode and caches
+.mypy_cache/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Distribution / packaging
+backend/build/
+backend/dist/
+backend/*.egg-info/
+backend/pip-wheel-metadata/
+
+# Testing artifacts
+backend/.pytest_cache/
+backend/.tox/
+backend/.coverage
+backend/htmlcov/
+backend/instance/
+
+
+# ===================================================================
+# Node.js / Vite / React Frontend (in frontend/)
+# ===================================================================
+
+# Dependencies - this is the most important one!
+frontend/node_modules/
+
+# Build output
+frontend/dist/
+frontend/build/
+
+# Vite specific cache
+frontend/.vite/
+
+# Environment files - **DO NOT COMMIT SECRETS**
+frontend/.env.local
+frontend/.env.*.local
+
+# Log files
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Editor directories and files
+frontend/.idea
+frontend/dump.rdb
+frontend/coverage
