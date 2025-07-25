@@ -1,1 +1,1 @@
-from .gemini_schemas import GetModelPayload, ListModelsPayload, ListModelsResponse, Model
+from .gemini_models_schemas import GetModelPayload, ListModelsPayload, ListModelsResponse, Model

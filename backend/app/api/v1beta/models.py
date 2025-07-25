@@ -1,4 +1,4 @@
-from venv import logger
+from typing import Annotated
 
 from app.core import manager
 from app.schemas import GetModelPayload, ListModelsPayload, ListModelsResponse, Model
@@ -12,40 +12,25 @@ router = APIRouter(tags=["Models"])
     "/models",
     response_model=ListModelsResponse,
     response_model_exclude_none=True,
+    name="models.list",
 )
-async def list_models(
-    page_size: int | None = Query(
-        None,
-        alias="pageSize",
-        ge=1,
-        description="The maximum number of Models to return (per page).",
-    ),
-    page_token: str | None = Query(
-        None,
-        alias="pageToken",
-        description="A page token, received from a previous models.list call.",
-    ),
-):
+async def list_models(params: Annotated[ListModelsPayload, Query()]):
     """
-    列出所有可用的模型。
+    Lists the Models available through the Gemini API.
     """
-    payload = ListModelsPayload(pageSize=page_size, pageToken=page_token)
-    logger.info(f"Listing models with payload: {payload}")
-    # 使用管理器代理请求
-    response_data = await manager.proxy_request(command_type="listModels", payload=payload)
+    response_data = await manager.proxy_request(command_type="listModels", payload=params)
     return response_data
 
 
 @router.get(
-    "/models/{model_name}",
+    "/models/{name}",
     response_model=Model,
     response_model_exclude_none=True,
+    name="models.get",
 )
-async def get_model(model_name: str = Path(..., description="The resource name of the model.")):
+async def get_model(params: Annotated[GetModelPayload, Path()]):
     """
-    获取指定模型的详细信息。
+    Gets information about a specific Model such as its version number, token limits, parameters and other metadata.
     """
-    payload = GetModelPayload(name=model_name)
-    # 使用管理器代理请求
-    response_data = await manager.proxy_request(command_type="getModel", payload=payload)
+    response_data = await manager.proxy_request(command_type="getModel", payload=params)
     return response_data
