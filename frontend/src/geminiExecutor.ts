@@ -20,7 +20,7 @@ async function executeListModels(payload: any) {
 }
 
 async function executeGetModel(payload: any) {
-  const modelName = payload.modelName;
+  const modelName = payload.name;
   const response = await fetch(`${GOOGLE_API_URL}/models/${modelName}`, {
     headers: { 'Content-Type': 'application/json' },
   });
