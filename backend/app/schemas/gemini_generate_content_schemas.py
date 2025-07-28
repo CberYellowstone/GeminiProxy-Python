@@ -506,8 +506,8 @@ class GroundingSupport(BaseModel):
         alias="groundingChunkIndices",
         description="A list of indices (into 'grounding_chunk') specifying the citations associated with the claim. For instance [1,3,4] means that grounding_chunk[1], grounding_chunk[3], grounding_chunk[4] are the retrieved content attributed to the claim.",
     )
-    confidence_scores: list[float] = Field(
-        ...,
+    confidence_scores: list[float] | None = Field(
+        None,
         alias="confidenceScores",
         description="Confidence score of the support references. Ranges from 0 to 1. 1 is the most confident. This list must have the same size as the groundingChunkIndices.",
     )
