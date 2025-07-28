@@ -1,5 +1,6 @@
 import { GoogleGenAI } from "@google/genai";
 import type { Command } from '../types/types';
+import { executeGenerateContent } from "./generatingContent";
 import { executeGetModel, executeListModels } from './models';
 
 export const GOOGLE_API_URL = "https://generativelanguage.googleapis.com/v1beta";
@@ -27,6 +28,8 @@ export const geminiExecutor = {
         return executeListModels(command.payload);
       case 'getModel':
         return executeGetModel(command.payload);
+      case 'generateContent':
+        return executeGenerateContent(command.payload);
       default:
         const exhaustiveCheck: never = command;
         throw new Error(`Unsupported command type: ${(exhaustiveCheck as any).type}`);

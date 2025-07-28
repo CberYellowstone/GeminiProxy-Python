@@ -1,8 +1,9 @@
+import { generateContentCommand, GenerateContentResponse } from './generatingContent';
 import type { GetModelCommand, GetModelCommandResponse, ListModelsCommand, ListModelsCommandResponse } from './models';
 
-export type Command = ListModelsCommand | GetModelCommand;
+export type Command = ListModelsCommand | GetModelCommand | generateContentCommand;
 
-export type ResponsePayload = ListModelsCommandResponse | GetModelCommandResponse;
+export type ResponsePayload = ListModelsCommandResponse | GetModelCommandResponse | GenerateContentResponse;
 
 export interface ErrorPayload {
   id: string;
