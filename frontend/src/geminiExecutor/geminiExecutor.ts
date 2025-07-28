@@ -1,7 +1,11 @@
-import type { Command } from './types';
 import { GoogleGenAI } from "@google/genai";
+import type { Command } from '../types';
 
 const GOOGLE_API_URL = "https://generativelanguage.googleapis.com/v1beta";
+
+// The API key is managed by the AI Studio environment.
+// The SDK will use the credentials available in the browser context.
+const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || "" });
 
 async function executeListModels(payload: any) {
   const params = new URLSearchParams();
@@ -33,10 +37,6 @@ async function executeGetModel(payload: any) {
 }
 
 async function testGeminiConnection(): Promise<string> {
-    // The API key is managed by the AI Studio environment.
-    // The SDK will use the credentials available in the browser context.
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || "" });
-
     const response = await ai.models.generateContent({
       model: 'gemini-2.5-flash',
       contents: 'hello',

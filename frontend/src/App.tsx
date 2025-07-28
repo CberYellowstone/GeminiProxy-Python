@@ -1,15 +1,13 @@
-
-
-import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { geminiExecutor } from './geminiExecutor/geminiExecutor';
 import { websocketService } from './websocketService';
-import { geminiExecutor } from './geminiExecutor';
 
 // Import components
-import Header from './components/Header';
 import ConnectionSettings from './components/ConnectionSettings';
-import StatusDashboard from './components/StatusDashboard';
 import EventLog from './components/EventLog';
 import Footer from './components/Footer';
+import Header from './components/Header';
+import StatusDashboard from './components/StatusDashboard';
 
 const CLIENT_ID_STORAGE_KEY = 'gemini-proxy-clientId';
 const WEBSOCKET_URL_STORAGE_KEY = 'gemini-proxy-ws-url';
