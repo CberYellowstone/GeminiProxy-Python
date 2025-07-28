@@ -81,27 +81,34 @@ const App = () => {
 
   // Effect for initial setup and cleanup
   useEffect(() => {
-    let storedId = localStorage.getItem(CLIENT_ID_STORAGE_KEY);
-    if (!storedId) {
-      storedId = generateNewClientId();
-      localStorage.setItem(CLIENT_ID_STORAGE_KEY, storedId);
-      addLog(`No Client ID found. Generated a new one: ${storedId}`);
+    // --- Client ID Initialization ---
+    let idToUse: string;
+    const storedId = localStorage.getItem(CLIENT_ID_STORAGE_KEY);
+    if (storedId) {
+      idToUse = storedId;
+      addLog(`Found existing Client ID: ${idToUse}`);
     } else {
-      addLog(`Found existing Client ID: ${storedId}`);
+      idToUse = generateNewClientId();
+      localStorage.setItem(CLIENT_ID_STORAGE_KEY, idToUse);
+      addLog(`No Client ID found. Generated a new one: ${idToUse}`);
     }
-    setClientId(storedId);
+    setClientId(idToUse);
 
-    let storedUrl = localStorage.getItem(WEBSOCKET_URL_STORAGE_KEY);
-    if (!storedUrl) {
-      storedUrl = DEFAULT_WEBSOCKET_URL;
-      localStorage.setItem(WEBSOCKET_URL_STORAGE_KEY, storedUrl);
-      addLog(`Using default WebSocket URL: ${storedUrl}`);
+    // --- WebSocket URL Initialization ---
+    let urlToUse: string;
+    const storedUrl = localStorage.getItem(WEBSOCKET_URL_STORAGE_KEY);
+    if (storedUrl) {
+      urlToUse = storedUrl;
+      addLog(`Found existing WebSocket URL: ${urlToUse}`);
     } else {
-      addLog(`Found existing WebSocket URL: ${storedUrl}`);
+      urlToUse = DEFAULT_WEBSOCKET_URL;
+      localStorage.setItem(WEBSOCKET_URL_STORAGE_KEY, urlToUse);
+      addLog(`Using default WebSocket URL: ${urlToUse}`);
     }
-    setWebsocketUrl(storedUrl);
+    setWebsocketUrl(urlToUse);
     
-    connectApp(storedUrl, storedId);
+    // --- Initial Connection ---
+    connectApp(urlToUse, idToUse);
     
     // Cleanup timeout on component unmount
     return () => {
@@ -109,8 +116,7 @@ const App = () => {
         clearTimeout(testStatusTimeoutRef.current);
       }
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []); // Run only once on mount
+  }, [addLog, connectApp]); // Dependencies are stable due to useCallback
 
   const handleClientIdChange = (newId: string) => {
     setClientId(newId);
@@ -152,6 +158,9 @@ const App = () => {
     setTestStatus('testing');
     try {
       const result = await geminiExecutor.testGeminiConnection();
+      if (!result || result.trim() === '') {
+        throw new Error("No response received from Gemini API.");
+      }
       addLog(`Gemini test successful. Response: "${result.trim()}"`);
       setTestStatus('success');
     } catch (error) {

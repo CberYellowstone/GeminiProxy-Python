@@ -1,5 +1,5 @@
 import { geminiExecutor } from './geminiExecutor/geminiExecutor';
-import type { BackendResponse, Command, ErrorPayload, ResponsePayload } from './types';
+import type { BackendResponse, Command, ErrorPayload, ResponsePayload } from './types/types';
 
 export interface ConnectionCallbacks {
     onOpen: () => void;
