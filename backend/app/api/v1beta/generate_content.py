@@ -1,7 +1,7 @@
 from typing import Annotated
 
 from app.core import manager
-from app.schemas.gemini_generate_content_schemas import GenerateContentPayload, GenerateContentResponse
+from app.schemas import GenerateContentPayload, GenerateContentResponse
 from fastapi import Path
 from fastapi.routing import APIRouter
 

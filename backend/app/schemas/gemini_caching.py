@@ -1,6 +1,6 @@
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .gemini_generate_content_schemas import Content, Tool, ToolConfig, UsageMetadata
+from .gemini_generate_content import Content, Tool, ToolConfig, UsageMetadata
 
 
 class CachedContent(BaseModel):
