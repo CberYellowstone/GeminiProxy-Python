@@ -2,12 +2,23 @@ import logging
 
 from app.api import api_router
 from app.core import manager
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status
+from app.core.exceptions import ApiException
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, status
+from fastapi.responses import JSONResponse
 
 app = FastAPI(
     title="GeminiProxy-Python",
     description="Manages WebSocket connections and proxies requests to Gemini API via frontend executors.",
 )
+
+
+@app.exception_handler(ApiException)
+async def api_exception_handler(request: Request, exc: ApiException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=exc.detail,
+    )
+
 
 app.include_router(api_router)
 

@@ -14,16 +14,29 @@ interface Model {
   thinking?: boolean;
 }
 
+interface ListModelsResponse {
+  models: Model[];
+  nextPageToken?: string;
+}
+
 interface ListModelsCommandResponse {
   id: string;
-  payload: {
-    models: Model[];
-  };
+  payload: ListModelsResponse;
+  status: {
+    error: boolean;
+    code: number;
+    errorPayload?: any;
+  }
 }
 
 interface GetModelCommandResponse {
   id: string;
   payload: Model;
+  status: {
+    error: boolean;
+    code: number;
+    errorPayload?: any;
+  }
 }
 
 interface ListModelsCommandPayload {
@@ -55,7 +68,6 @@ export type {
   GetModelCommandResponse,
   ListModelsCommand,
   ListModelsCommandPayload,
-  ListModelsCommandResponse,
-  Model
+  ListModelsCommandResponse, ListModelsResponse, Model
 };
 

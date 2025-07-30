@@ -3,6 +3,7 @@ import logging
 import uuid
 from typing import Any
 
+from app.core.exceptions import ApiException
 from fastapi import HTTPException, WebSocket, status
 from pydantic import BaseModel
 
@@ -37,8 +38,15 @@ class ConnectionManager:
         request_id = message.get("id")
         if request_id and request_id in self.pending_responses:
             future = self.pending_responses.pop(request_id)
-            future.set_result(message.get("payload"))
-            logging.info(f"Response received for request_id: {request_id}")
+            if message.get("status", {}).get("error"):
+                code = message["status"].get("code")
+                error_payload = message["status"].get("errorPayload")
+                exception = ApiException(status_code=code, detail=error_payload)
+                future.set_exception(exception)
+                logging.info(f"Error response received for request_id: {request_id}")
+            else:
+                future.set_result(message.get("payload"))
+                logging.info(f"Response received for request_id: {request_id}")
 
     def get_next_client(self) -> str:
         """轮询算法，获取下一个健康的客户端ID"""
@@ -93,6 +101,8 @@ class ConnectionManager:
                 status_code=status.HTTP_504_GATEWAY_TIMEOUT,
                 detail="Request to frontend client timed out",
             )
+        except ApiException as e:
+            raise e
         except Exception as e:
             logging.error(f"An error occurred for request_id {request_id}: {e}")
             self.pending_responses.pop(request_id, None)

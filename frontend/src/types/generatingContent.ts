@@ -26,6 +26,11 @@ interface GenerateContentResponse {
 interface generateContentCommandResponse {
     id: string;
     payload: GenerateContentResponse;
+  status: {
+    error: boolean;
+    code: number;
+    errorPayload?: any;
+  }
 }
 
 interface generateContentCommand {
@@ -35,9 +40,9 @@ interface generateContentCommand {
 }
 
 export type {
-    generateContentCommand, generateContentCommandPayload,
-    generateContentCommandResponse,
-    generateContentPayload,
-    GenerateContentResponse
+  generateContentCommand, generateContentCommandPayload,
+  generateContentCommandResponse,
+  generateContentPayload,
+  GenerateContentResponse
 };
 

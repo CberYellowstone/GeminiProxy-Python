@@ -1,7 +1,8 @@
-import type { GetModelCommandPayload, ListModelsCommandPayload } from '../types/models';
+import { ApiError } from '../errors/ApiError';
+import type { GetModelCommandPayload, ListModelsCommandPayload, ListModelsResponse } from '../types/models';
 import { GOOGLE_API_URL } from './geminiExecutor';
 
-async function executeListModels(payload: ListModelsCommandPayload) {
+async function executeListModels(payload: ListModelsCommandPayload): Promise<ListModelsResponse> {
   const params = new URLSearchParams();
   if (payload.pageSize) params.append('pageSize', String(payload.pageSize));
   if (payload.pageToken) params.append('pageToken', String(payload.pageToken));
@@ -12,7 +13,7 @@ async function executeListModels(payload: ListModelsCommandPayload) {
 
   if (!response.ok) {
     const error = await response.json().catch(() => ({ error: { message: response.statusText } }));
-    throw new Error(error.error?.message || response.statusText);
+    throw new ApiError(error.error?.message || response.statusText, response.status, error);
   }
   return await response.json();
 }
@@ -25,7 +26,7 @@ async function executeGetModel(payload: GetModelCommandPayload) {
 
   if (!response.ok) {
     const error = await response.json().catch(() => ({ error: { message: response.statusText } }));
-    throw new Error(error.error?.message || response.statusText);
+    throw new ApiError(error.error?.message || response.statusText, response.status, error);
   }
   return await response.json();
 }

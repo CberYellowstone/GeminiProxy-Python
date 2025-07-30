@@ -7,10 +7,12 @@ export type ResponsePayload = ListModelsCommandResponse | GetModelCommandRespons
 
 export interface ErrorPayload {
   id: string;
-  payload: {
-    message: string;
+  payload?: any;
+  status: {
+    error: boolean;
     code: number;
-  };
+    errorPayload?: any;
+  }
 }
 
 export type BackendResponse = ResponsePayload | ErrorPayload;
