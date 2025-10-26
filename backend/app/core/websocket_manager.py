@@ -6,6 +6,7 @@ from typing import Any, AsyncGenerator
 from app.core.exceptions import ApiException
 from fastapi import HTTPException, WebSocket, status
 from pydantic import BaseModel
+from rich.markup import escape
 
 
 class ConnectionManager:
@@ -32,10 +33,9 @@ class ConnectionManager:
 
     async def handle_message(self, message: dict[str, Any]):
         """处理从前端收到的响应消息"""
-        logging.info(f"Received WebSocket message from client: {message}")
-        request_id = message.get("id")
         payload = message.get("payload", {})
 
+        request_id = message.get("id")
         # 检查是否为流式响应
         if request_id in self.streaming_responses:
             queue = self.streaming_responses[request_id]
@@ -96,7 +96,11 @@ class ConnectionManager:
             "type": command_type,
             "payload": payload_to_send,
         }
-        logging.info(f"Sending WebSocket message to client: {command}")
+        logging.info(
+            f"[bold]Sending request[/bold] [bold cyan]{request_id}[/bold cyan] "
+            f"[bold]to client[/bold] [bold cyan]{client_id}[/bold cyan]. "
+            f"Payload: [grey50]{escape(str(command))}[/grey50]"
+        )
 
         # 处理流式请求
         if is_streaming:

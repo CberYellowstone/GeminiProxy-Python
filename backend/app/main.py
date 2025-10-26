@@ -1,4 +1,5 @@
 import logging
+import logging.config
 
 from app.api import api_router
 from app.core import manager
@@ -6,6 +7,40 @@ from app.core.exceptions import ApiException
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from rich.logging import RichHandler
+from rich.markup import escape
+
+LOGGING_CONFIG = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "handlers": {
+        "rich": {
+            "class": "rich.logging.RichHandler",
+            "rich_tracebacks": True,
+            "markup": True,
+            "log_time_format": "[%Y-%m-%d %H:%M:%S]",
+        },
+    },
+    "loggers": {
+        "": {  # Root logger
+            "handlers": ["rich"],
+            "level": "INFO",
+            "propagate": False,
+        },
+        "uvicorn.error": {
+            "handlers": ["rich"],
+            "level": "INFO",
+            "propagate": False,
+        },
+        "uvicorn.access": {
+            "handlers": ["rich"],
+            "level": "INFO",
+            "propagate": False,
+        },
+    },
+}
+
+logging.config.dictConfig(LOGGING_CONFIG)
 
 app = FastAPI(
     title="GeminiProxy-Python",
@@ -51,7 +86,12 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
     try:
         while True:
             data = await websocket.receive_json()
-            logging.info(f"Received response from {client_id}: {data}")
+            request_id = data.get("id")
+            logging.info(
+                f"[bold]Received response for request[/bold] [bold cyan]{request_id}[/bold cyan] "
+                f"[bold]from client[/bold] [bold cyan]{client_id}[/bold cyan]. "
+                f"Payload: [grey50]{escape(str(data))}[/grey50]"
+            )
             await manager.handle_message(data)  # 将消息交给管理器处理
 
     except WebSocketDisconnect:
