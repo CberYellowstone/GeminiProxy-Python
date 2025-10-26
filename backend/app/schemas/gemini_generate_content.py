@@ -1,6 +1,13 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from .gemini_enums import (
     Behavior,
@@ -405,6 +412,16 @@ class GenerateContentPayload(BaseModel):
         alias="cachedContent",
         description="Optional. The name of the content cached to use as context to serve the prediction.",
     )
+
+    @field_validator("tools", mode="before")
+    def validate_tools(cls, v):
+        if isinstance(v, dict):
+            try:
+                Tool.model_validate(v)
+                return [v]
+            except ValidationError:
+                raise ValueError("Invalid Tool object provided as a dictionary")
+        return v
 
     model_config = ConfigDict(populate_by_name=True)
 

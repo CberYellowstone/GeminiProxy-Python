@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import uuid
 from typing import Any, AsyncGenerator
 
@@ -31,6 +32,7 @@ class ConnectionManager:
 
     async def handle_message(self, message: dict[str, Any]):
         """处理从前端收到的响应消息"""
+        logging.info(f"Received WebSocket message from client: {message}")
         request_id = message.get("id")
         payload = message.get("payload", {})
 
@@ -94,6 +96,7 @@ class ConnectionManager:
             "type": command_type,
             "payload": payload_to_send,
         }
+        logging.info(f"Sending WebSocket message to client: {command}")
 
         # 处理流式请求
         if is_streaming:

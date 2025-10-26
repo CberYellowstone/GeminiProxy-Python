@@ -4,6 +4,7 @@ from app.api import api_router
 from app.core import manager
 from app.core.exceptions import ApiException
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 app = FastAPI(
@@ -17,6 +18,15 @@ async def api_exception_handler(request: Request, exc: ApiException):
     return JSONResponse(
         status_code=exc.status_code,
         content=exc.detail,
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    logging.error(exc.errors())
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content=exc.errors(),
     )
 
 
