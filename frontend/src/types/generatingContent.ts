@@ -39,6 +39,12 @@ interface generateContentCommand {
     payload: generateContentCommandPayload;
 }
 
+export interface StreamGenerateContentCommand {
+    id: string;
+    type: 'streamGenerateContent';
+    payload: generateContentCommandPayload;
+}
+
 export type {
   generateContentCommand, generateContentCommandPayload,
   generateContentCommandResponse,

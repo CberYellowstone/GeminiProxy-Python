@@ -1,6 +1,6 @@
 import { ApiError } from './errors/ApiError';
 import { geminiExecutor } from './geminiExecutor/geminiExecutor';
-import type { BackendResponse, Command, ErrorPayload, ResponsePayload } from './types/types';
+import type { Command, ErrorPayload, ResponsePayload } from './types/types';
 
 export interface ConnectionCallbacks {
   onOpen: () => void;
@@ -93,21 +93,28 @@ const connectInternal = () => {
 
   ws.onmessage = async (event) => {
     let command: Command | null = null;
-    const sendResponse = (response: BackendResponse) => {
-      ws?.send(JSON.stringify(response));
-    };
     try {
       command = JSON.parse(event.data) as Command;
       callbacks?.onLog(`Received command: ${command.type} (ID: ${command.id})`);
 
-      const result = await geminiExecutor.execute(command);
-      const response: ResponsePayload = { id: command.id, payload: result, status: { error: false, code: 200 } };
-      sendResponse(response);
-      callbacks?.onLog(`Successfully executed command ID: ${command.id}`);
+      const sendResponse = (payload: unknown) => {
+        const response = { id: command?.id, payload };
+        ws?.send(JSON.stringify(response));
+      };
+
+      if (command.type === 'streamGenerateContent') {
+        await geminiExecutor.execute(command, sendResponse);
+        callbacks?.onLog(`Finished streaming for command ID: ${command.id}`);
+      } else {
+        const result = await geminiExecutor.execute(command, sendResponse);
+        const response: ResponsePayload = { id: command.id, payload: result, status: { error: false, code: 200 } };
+        ws?.send(JSON.stringify(response));
+        callbacks?.onLog(`Successfully executed command ID: ${command.id}`);
+      }
     } catch (error) {
       const responseId = command?.id || 'unknown';
       const response = createErrorResponse(error, responseId);
-      sendResponse(response);
+      ws?.send(JSON.stringify(response));
       callbacks?.onLog(`Sent error response for command ID: ${responseId}`);
     }
   };

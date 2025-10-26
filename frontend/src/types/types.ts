@@ -1,7 +1,7 @@
-import { generateContentCommand, GenerateContentResponse } from './generatingContent';
+import { generateContentCommand, GenerateContentResponse, StreamGenerateContentCommand } from './generatingContent';
 import type { GetModelCommand, GetModelCommandResponse, ListModelsCommand, ListModelsCommandResponse } from './models';
 
-export type Command = ListModelsCommand | GetModelCommand | generateContentCommand;
+export type Command = ListModelsCommand | GetModelCommand | generateContentCommand | StreamGenerateContentCommand;
 
 export type ResponsePayload = ListModelsCommandResponse | GetModelCommandResponse | GenerateContentResponse;
 
