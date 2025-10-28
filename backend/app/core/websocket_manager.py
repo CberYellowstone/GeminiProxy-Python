@@ -1,7 +1,8 @@
 import asyncio
 import logging
 import uuid
-from typing import Any, AsyncGenerator, Optional
+from collections.abc import AsyncGenerator
+from typing import Any
 
 from app.core.config import settings
 from app.core.exceptions import ApiException
@@ -98,10 +99,10 @@ class ConnectionManager:
 
     async def proxy_request(
         self, 
-        command_type: str, 
-        payload: Any, 
+        command_type: str,
+        payload: Any,
         is_streaming: bool = False,
-        request_id: Optional[str] = None
+        request_id: str | None = None
     ) -> Any:
         """
         核心代理方法：选择客户端，发送指令，并等待响应。
