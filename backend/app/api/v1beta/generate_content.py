@@ -3,7 +3,7 @@ from typing import Annotated
 
 from app.core import manager
 from app.schemas import GenerateContentPayload, GenerateContentResponse
-from fastapi import Depends, Path, Request
+from fastapi import Path, Request
 from fastapi.responses import StreamingResponse
 from fastapi.routing import APIRouter
 
@@ -17,13 +17,12 @@ router = APIRouter(tags=["Generating content"])
     name="models.generateContent",
 )
 async def generate_content(
-    model: Annotated[str, Path(description="The model to use for content generation.")],
+    model: Annotated[str, Path(description="Required. The name of the Model to use for generating the completion.")],
     payload: GenerateContentPayload,
     request: Request,
 ):
     """
-    Non-streaming content generation endpoint.
-    Cancellation logic is handled by the ConnectionManager.
+    Generates a model response given an input GenerateContentRequest. Refer to the text generation guide for detailed usage information. Input capabilities differ between models, including tuned models. Refer to the model guide and tuning guide for details.
     """
     request_id = str(uuid.uuid4())
     async with manager.monitored_proxy_request(request_id, request):
@@ -43,13 +42,12 @@ async def generate_content(
     name="models.streamGenerateContent",
 )
 async def stream_generate_content(
-    model: Annotated[str, Path(description="The model to use for content generation.")],
+    model: Annotated[str, Path(description="Required. The name of the Model to use for generating the completion.")],
     payload: GenerateContentPayload,
     request: Request,
 ):
     """
-    Streaming content generation endpoint.
-    Monitoring and cancellation logic is handled by the ConnectionManager.
+    Generates a streamed response from the model given an input GenerateContentRequest.
     """
     request_id = str(uuid.uuid4())
     async def generator():
