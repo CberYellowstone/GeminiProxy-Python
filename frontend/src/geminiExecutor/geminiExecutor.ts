@@ -22,7 +22,7 @@ async function testGeminiConnection(): Promise<string> {
 }
 
 export const geminiExecutor = {
-  execute: (command: Command, sendResponse: (payload: unknown) => void): Promise<any> => {
+  execute: async (command: Command, sendResponse: (payload: unknown) => void): Promise<any> => {
     switch (command.type) {
       case 'listModels':
         return executeListModels(command.payload);
@@ -31,8 +31,8 @@ export const geminiExecutor = {
       case 'generateContent':
         return executeGenerateContent(command, activeRequests);
       case 'streamGenerateContent':
-        executeStreamGenerateContent(command, sendResponse, activeRequests);
-        return Promise.resolve();
+        await executeStreamGenerateContent(command, sendResponse, activeRequests);
+        return;
       default:
         const exhaustiveCheck: never = command;
         throw new Error(`Unsupported command type: ${(exhaustiveCheck as any).type}`);
