@@ -3,6 +3,7 @@ import logging
 import uuid
 from typing import Any, AsyncGenerator, Optional
 
+from app.core.config import settings
 from app.core.exceptions import ApiException
 from fastapi import HTTPException, WebSocket, status
 from pydantic import BaseModel
@@ -160,7 +161,7 @@ class ConnectionManager:
 
         try:
             await websocket.send_json(command)
-            response_payload = await asyncio.wait_for(future, timeout=30.0)
+            response_payload = await asyncio.wait_for(future, timeout=settings.WEBSOCKET_TIMEOUT)
             return response_payload
         except asyncio.TimeoutError:
             self.pending_responses.pop(request_id, None)
