@@ -104,7 +104,7 @@ const connectInternal = () => {
         const cancelled = geminiExecutor.cancelExecution(requestId);
         
         if (cancelled) {
-          callbacks?.onLog(`Successfully cancelled request: ${requestId}`);
+          // Log line removed as per new logging strategy
         } else {
           callbacks?.onLog(`Request ${requestId} was not active or already completed`);
         }

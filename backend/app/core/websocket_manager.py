@@ -138,13 +138,20 @@ class ConnectionManager:
             self.streaming_responses[request_id] = queue
 
             async def stream_generator() -> AsyncGenerator[Any, None]:
-                # ✓ 修改：移除 finally 块
-                await websocket.send_json(command)
-                while True:
-                    item = await queue.get()
-                    if item is None:
-                        break
-                    yield item
+                try:
+                    # ✓ 修改：移除 finally 块
+                    await websocket.send_json(command)
+                    while True:
+                        item = await queue.get()
+                        if item is None:
+                            break
+                        yield item
+                except RuntimeError as e:
+                    logging.warning(
+                        f"Connection closed before streaming could complete for request {request_id}: {e}"
+                    )
+                    # Gracefully exit the generator
+                    return
 
             return stream_generator()
 
