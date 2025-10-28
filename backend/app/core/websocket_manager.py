@@ -1,12 +1,12 @@
 import asyncio
 import logging
-import uuid
 from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from typing import Any
 
 from app.core.config import settings
 from app.core.exceptions import ApiException
-from fastapi import HTTPException, WebSocket, status
+from fastapi import HTTPException, Request, WebSocket, status
 from pydantic import BaseModel
 from rich.markup import escape
 
@@ -97,27 +97,45 @@ class ConnectionManager:
         """获取所有连接的客户端ID列表"""
         return list(self.active_connections.keys())
 
-    async def proxy_request(
-        self, 
-        command_type: str,
-        payload: Any,
-        is_streaming: bool = False,
-        request_id: str | None = None
-    ) -> Any:
+    @asynccontextmanager
+    async def monitored_proxy_request(self, request_id: str, request: Request):
         """
-        核心代理方法：选择客户端，发送指令，并等待响应。
-        对于流式请求，返回一个异步生成器。
+        An async context manager to monitor and clean up a proxy request.
+        It handles request registration and cancellation/cleanup upon exit.
         """
         client_id = self.get_next_client()
-        websocket = self.active_connections[client_id]
-        
-        if request_id is None:
-            request_id = str(uuid.uuid4())
-            
-        # 记录映射关系
         self.request_to_client[request_id] = client_id
         self.client_active_requests[client_id].add(request_id)
-        logging.debug(f"DEBUG: Request {request_id} successfully registered for client {client_id}.")
+        logging.debug(f"Registered request {request_id} for client {client_id}")
+        
+        try:
+            yield
+        finally:
+            if await request.is_disconnected():
+                logging.info(f"[DISCONNECT] Client disconnected for {request_id}")
+                await self.cancel_request(request_id)
+            else:
+                # For non-streaming requests, the future is cleaned up when the response is received.
+                # For streaming, it's cleaned up when the stream ends.
+                # This is a fallback for unexpected exits.
+                if request_id in self.pending_responses or request_id in self.streaming_responses:
+                    self._cleanup_request(request_id)
+
+    async def proxy_request(
+        self,
+        command_type: str,
+        payload: Any,
+        request: Request,
+        request_id: str,
+        is_streaming: bool = False,
+    ) -> Any:
+        """
+        Core proxy method: selects a client, sends a command, and awaits a response.
+        For streaming requests, it returns an async generator.
+        The actual registration and cleanup are handled by the `monitored_proxy_request` context manager.
+        """
+        client_id = self.request_to_client[request_id]
+        websocket = self.active_connections[client_id]
 
         if isinstance(payload, BaseModel):
             payload_to_send = payload.model_dump(by_alias=True, exclude_none=True)
@@ -129,6 +147,7 @@ class ConnectionManager:
             "type": command_type,
             "payload": payload_to_send,
         }
+        
         logging.info(
             f"[bold]Sending request[/bold] [bold cyan]{request_id}[/bold cyan] "
             f"[bold]to client[/bold] [bold cyan]{client_id}[/bold cyan]. "
@@ -136,48 +155,74 @@ class ConnectionManager:
         )
 
         if is_streaming:
-            queue: asyncio.Queue = asyncio.Queue()
-            self.streaming_responses[request_id] = queue
+            return await self._handle_streaming_request(websocket, command, request_id, request)
 
-            async def stream_generator() -> AsyncGenerator[Any, None]:
-                try:
-                    # ✓ 修改：移除 finally 块
-                    await websocket.send_json(command)
-                    while True:
-                        item = await queue.get()
-                        if item is None:
-                            break
-                        yield item
-                except RuntimeError as e:
-                    logging.warning(
-                        f"Connection closed before streaming could complete for request {request_id}: {e}"
-                    )
-                    # Gracefully exit the generator
-                    return
+        return await self._handle_non_streaming_request(websocket, command, request_id)
 
-            return stream_generator()
-
+    async def _handle_non_streaming_request(
+        self, websocket: WebSocket, command: dict[str, Any], request_id: str
+    ) -> Any:
+        """Handles a non-streaming request."""
         future = asyncio.get_running_loop().create_future()
         self.pending_responses[request_id] = future
-
         try:
             await websocket.send_json(command)
-            response_payload = await asyncio.wait_for(future, timeout=settings.WEBSOCKET_TIMEOUT)
+            response_payload = await asyncio.wait_for(
+                future, timeout=settings.WEBSOCKET_TIMEOUT
+            )
+            # Cleanup is handled when the response is received in `handle_message`
             return response_payload
         except asyncio.TimeoutError:
-            self.pending_responses.pop(request_id, None)
+            self._cleanup_request(request_id)
             raise HTTPException(
                 status_code=status.HTTP_504_GATEWAY_TIMEOUT,
                 detail="Request to frontend client timed out",
             )
         except ApiException as e:
+            self._cleanup_request(request_id)
             raise e
-        except Exception:
-            self.pending_responses.pop(request_id, None)
+        except Exception as e:
+            self._cleanup_request(request_id)
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="Error communicating with frontend client",
+                detail=f"Error communicating with frontend client: {str(e)}",
             )
+
+    async def _handle_streaming_request(
+        self,
+        websocket: WebSocket,
+        command: dict[str, Any],
+        request_id: str,
+        request: Request,
+    ) -> AsyncGenerator[Any, None]:
+        """Handles a streaming request and returns an async generator."""
+        queue: asyncio.Queue = asyncio.Queue()
+        self.streaming_responses[request_id] = queue
+
+        async def stream_generator() -> AsyncGenerator[Any, None]:
+            try:
+                await websocket.send_json(command)
+                while True:
+                    # Check for disconnect before waiting for the next item
+                    if await request.is_disconnected():
+                        logging.info(f"[DISCONNECT] Client disconnected during stream for {request_id}")
+                        # No need to call cancel_request here, the context manager will handle it
+                        break
+
+                    try:
+                        item = await asyncio.wait_for(queue.get(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        # Timeout allows us to re-check the disconnect status
+                        continue
+                    
+                    if item is None:  # End of stream signal
+                        break
+                    yield item
+            finally:
+                # The context manager will ultimately handle the final cleanup
+                pass
+        
+        return stream_generator()
 
     async def cancel_request(self, request_id: str) -> bool:
         """

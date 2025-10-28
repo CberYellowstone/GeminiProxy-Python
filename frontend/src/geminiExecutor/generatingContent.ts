@@ -1,28 +1,45 @@
 import { ApiError } from '../errors/ApiError';
 import type {
-  generateContentCommandPayload,
+  generateContentCommand,
   GenerateContentResponse,
   StreamGenerateContentCommand
 } from '../types/generatingContent';
 import { GOOGLE_API_URL } from "./geminiExecutor";
 
 async function executeGenerateContent(
-  payload: generateContentCommandPayload
+  command: generateContentCommand,
+  activeRequests: Map<string, AbortController>
 ): Promise<GenerateContentResponse> {
-  const model = payload.model;
-  const response = await fetch(`${GOOGLE_API_URL}/models/${model}:generateContent`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(payload.payload),
-  });
-  
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({ error: { message: response.statusText } }));
-    throw new ApiError(error.error?.message || response.statusText, response.status, error);
+  const model = command.payload.model;
+  const requestId = command.id;
+
+  const abortController = new AbortController();
+  activeRequests.set(requestId, abortController);
+
+  try {
+    const response = await fetch(`${GOOGLE_API_URL}/models/${model}:generateContent`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(command.payload.payload),
+      signal: abortController.signal,
+    });
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({ error: { message: response.statusText } }));
+      throw new ApiError(error.error?.message || response.statusText, response.status, error);
+    }
+    return await response.json();
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      console.debug(`Request ${requestId} was aborted`);
+    }
+    throw error;
+  } finally {
+    activeRequests.delete(requestId);
+    console.debug(`Cleaned up resources for request ${requestId}`);
   }
-  return await response.json();
 }
 
 async function executeStreamGenerateContent(

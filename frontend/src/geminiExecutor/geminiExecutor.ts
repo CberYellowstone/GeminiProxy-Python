@@ -29,7 +29,7 @@ export const geminiExecutor = {
       case 'getModel':
         return executeGetModel(command.payload);
       case 'generateContent':
-        return executeGenerateContent(command.payload);
+        return executeGenerateContent(command, activeRequests);
       case 'streamGenerateContent':
         executeStreamGenerateContent(command, sendResponse, activeRequests);
         return Promise.resolve();
