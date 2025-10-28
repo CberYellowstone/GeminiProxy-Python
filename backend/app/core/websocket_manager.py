@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import uuid
-from typing import Any, AsyncGenerator
+from typing import Any, AsyncGenerator, Optional
 
 from app.core.exceptions import ApiException
 from fastapi import HTTPException, WebSocket, status
@@ -12,11 +12,15 @@ from rich.markup import escape
 class ConnectionManager:
     def __init__(self) -> None:
         self.active_connections: dict[str, WebSocket] = {}
-        # 用于追踪请求和响应的字典
         self.pending_responses: dict[str, asyncio.Future] = {}
-        # 新增：用于处理流式响应的队列
         self.streaming_responses: dict[str, asyncio.Queue] = {}
-        # 用于轮询的客户端 ID 列表和索引
+        
+        # 新增：追踪 request_id 到 client_id 的映射
+        self.request_to_client: dict[str, str] = {}
+        
+        # 新增：追踪每个 client 正在处理的请求集合
+        self.client_active_requests: dict[str, set[str]] = {}
+        
         self._client_ids: list[str] = []
         self._next_client_index: int = 0
 
@@ -24,8 +28,23 @@ class ConnectionManager:
         await websocket.accept()
         self.active_connections[client_id] = websocket
         self._client_ids.append(client_id)
+        self.client_active_requests[client_id] = set()
 
-    def disconnect(self, client_id: str):
+    async def disconnect(self, client_id: str):
+        """断开客户端连接，清理所有活跃请求"""
+        # 清理该客户端的所有活跃请求
+        if client_id in self.client_active_requests:
+            request_ids = list(self.client_active_requests[client_id])
+            logging.info(f"[DISCONNECT] Cancelling {len(request_ids)} requests for client {client_id}")
+            
+            # 使用 cancel_request 统一清理
+            for request_id in request_ids:
+                await self.cancel_request(request_id)
+            
+            # 确保客户端条目被删除
+            self.client_active_requests.pop(client_id, None)
+        
+        # 清理连接
         if client_id in self.active_connections:
             del self.active_connections[client_id]
         if client_id in self._client_ids:
@@ -34,21 +53,22 @@ class ConnectionManager:
     async def handle_message(self, message: dict[str, Any]):
         """处理从前端收到的响应消息"""
         payload = message.get("payload", {})
-
         request_id = message.get("id")
+        if request_id:
+            is_finished = payload.get("is_finished", "N/A")
+            logging.debug(f"DEBUG: Received message for request {request_id}. Is finished: {is_finished}.")
+        
         # 检查是否为流式响应
         if request_id in self.streaming_responses:
             queue = self.streaming_responses[request_id]
             if payload.get("is_streaming"):
-                # 只有当 chunk 存在时才放入队列
                 if "chunk" in payload:
                     queue.put_nowait(payload["chunk"])
-                # 当流结束时，发送 None 信号
                 if payload.get("is_finished"):
-                    queue.put_nowait(None)  # 发送流结束信号
-                    del self.streaming_responses[request_id]
+                    queue.put_nowait(None)
+                    self._cleanup_request(request_id)  # 正常完成时清理
             return
-
+        
         # 处理非流式响应
         if request_id and request_id in self.pending_responses:
             future = self.pending_responses.pop(request_id)
@@ -67,8 +87,6 @@ class ConnectionManager:
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="No frontend clients connected",
             )
-
-        # 简单的轮询
         client_id = self._client_ids[self._next_client_index]
         self._next_client_index = (self._next_client_index + 1) % len(self._client_ids)
         return client_id
@@ -77,14 +95,27 @@ class ConnectionManager:
         """获取所有连接的客户端ID列表"""
         return list(self.active_connections.keys())
 
-    async def proxy_request(self, command_type: str, payload: Any, is_streaming: bool = False) -> Any:
+    async def proxy_request(
+        self, 
+        command_type: str, 
+        payload: Any, 
+        is_streaming: bool = False,
+        request_id: Optional[str] = None
+    ) -> Any:
         """
         核心代理方法：选择客户端，发送指令，并等待响应。
         对于流式请求，返回一个异步生成器。
         """
         client_id = self.get_next_client()
         websocket = self.active_connections[client_id]
-        request_id = str(uuid.uuid4())
+        
+        if request_id is None:
+            request_id = str(uuid.uuid4())
+            
+        # 记录映射关系
+        self.request_to_client[request_id] = client_id
+        self.client_active_requests[client_id].add(request_id)
+        logging.debug(f"DEBUG: Request {request_id} successfully registered for client {client_id}.")
 
         if isinstance(payload, BaseModel):
             payload_to_send = payload.model_dump(by_alias=True, exclude_none=True)
@@ -102,26 +133,21 @@ class ConnectionManager:
             f"Payload: [grey50]{escape(str(command))}[/grey50]"
         )
 
-        # 处理流式请求
         if is_streaming:
             queue: asyncio.Queue = asyncio.Queue()
             self.streaming_responses[request_id] = queue
 
             async def stream_generator() -> AsyncGenerator[Any, None]:
-                try:
-                    await websocket.send_json(command)
-                    while True:
-                        item = await queue.get()
-                        if item is None:
-                            break
-                        yield item
-                finally:
-                    # 确保队列被清理
-                    self.streaming_responses.pop(request_id, None)
+                # ✓ 修改：移除 finally 块
+                await websocket.send_json(command)
+                while True:
+                    item = await queue.get()
+                    if item is None:
+                        break
+                    yield item
 
             return stream_generator()
 
-        # 处理非流式请求 (现有逻辑)
         future = asyncio.get_running_loop().create_future()
         self.pending_responses[request_id] = future
 
@@ -144,6 +170,88 @@ class ConnectionManager:
                 detail="Error communicating with frontend client",
             )
 
+    async def cancel_request(self, request_id: str) -> bool:
+        """
+        取消指定的请求（唯一入口点）
+        
+        职责：
+        1. 检查请求是否存在
+        2. 发送取消信号给前端
+        3. 清理后端资源
+        
+        Args:
+            request_id: 要取消的请求ID
+            
+        Returns:
+            bool: 取消操作是否成功启动
+        """
+        logging.debug(f"[CANCEL] Attempting to cancel request {request_id}")
+        
+        # 步骤 1：幂等性检查
+        if request_id not in self.request_to_client:
+            logging.debug(f"[CANCEL] Request {request_id} not found or already cancelled")
+            return False
+        
+        # 步骤 2：获取处理该请求的客户端
+        client_id = self.request_to_client[request_id]
+        
+        # 步骤 3：发送取消信号（best effort）
+        cancel_signal_sent = False
+        if client_id in self.active_connections:
+            websocket = self.active_connections[client_id]
+            cancel_message = {
+                "type": "cancel_task",
+                "id": request_id
+            }
+            try:
+                await websocket.send_json(cancel_message)
+                logging.info(f"[CANCEL] Sent cancel signal for {request_id} to {client_id}")
+                cancel_signal_sent = True
+            except Exception as e:
+                logging.error(f"[CANCEL] Failed to send cancel signal: {e}")
+                # 即使发送失败，也要继续清理后端资源
+        else:
+            logging.warning(f"[CANCEL] Client {client_id} not connected, cannot send signal")
+        
+        # 步骤 4：清理后端资源（必须执行）
+        self._cleanup_request(request_id)
+        
+        return True
 
-# 创建单例
+    def _cleanup_request(self, request_id: str):
+        """
+        清理与请求相关的所有内部资源（内部方法）
+        
+        注意：此方法是幂等的，可以安全地多次调用
+        """
+        cleaned_items = []
+        
+        # 清理 1：流式响应队列
+        if request_id in self.streaming_responses:
+            queue = self.streaming_responses.pop(request_id)
+            # 确保队列中的等待者被释放
+            try:
+                queue.put_nowait(None)
+            except asyncio.QueueFull:
+                pass
+            cleaned_items.append("queue")
+        
+        # 清理 2：请求映射关系
+        if request_id in self.request_to_client:
+            client_id = self.request_to_client.pop(request_id)
+            if client_id in self.client_active_requests:
+                self.client_active_requests[client_id].discard(request_id)
+            cleaned_items.append("mapping")
+        
+        # 清理 3：非流式响应的 Future
+        if request_id in self.pending_responses:
+            future = self.pending_responses.pop(request_id)
+            if not future.done():
+                future.cancel()
+            cleaned_items.append("future")
+        
+        if cleaned_items:
+            logging.debug(f"[CLEANUP] Cleaned {', '.join(cleaned_items)} for {request_id}")
+
+
 manager = ConnectionManager()

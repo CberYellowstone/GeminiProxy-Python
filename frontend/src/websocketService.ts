@@ -94,7 +94,24 @@ const connectInternal = () => {
   ws.onmessage = async (event) => {
     let command: Command | null = null;
     try {
-      command = JSON.parse(event.data) as Command;
+      const message = JSON.parse(event.data);
+      
+      // 新增：处理取消指令
+      if (message.type === 'cancel_task') {
+        const requestId = message.id;
+        callbacks?.onLog(`Received cancel request for: ${requestId}`);
+        
+        const cancelled = geminiExecutor.cancelExecution(requestId);
+        
+        if (cancelled) {
+          callbacks?.onLog(`Successfully cancelled request: ${requestId}`);
+        } else {
+          callbacks?.onLog(`Request ${requestId} was not active or already completed`);
+        }
+        return;
+      }
+      
+      command = message as Command;
       callbacks?.onLog(`Received command: ${command.type} (ID: ${command.id})`);
 
       const sendResponse = (payload: unknown) => {
