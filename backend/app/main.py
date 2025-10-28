@@ -95,7 +95,7 @@ async def websocket_endpoint(websocket: WebSocket, client_id: str):
             await manager.handle_message(data)  # 将消息交给管理器处理
 
     except WebSocketDisconnect:
-        manager.disconnect(client_id)
+        await manager.disconnect(client_id)
     except Exception as e:
         logging.error(f"Error in WebSocket for client {client_id}: {e}")
-        manager.disconnect(client_id)
+        await manager.disconnect(client_id)
