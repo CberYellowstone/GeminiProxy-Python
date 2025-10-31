@@ -413,16 +413,6 @@ class GenerateContentPayload(BaseModel):
         description="Optional. The name of the content cached to use as context to serve the prediction.",
     )
 
-    @field_validator("tools", mode="before")
-    def validate_tools(cls, v):
-        if isinstance(v, dict):
-            try:
-                Tool.model_validate(v)
-                return [v]
-            except ValidationError:
-                raise ValueError("Invalid Tool object provided as a dictionary")
-        return v
-
     model_config = ConfigDict(populate_by_name=True)
 
 
