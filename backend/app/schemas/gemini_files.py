@@ -21,11 +21,11 @@ class Status(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     @field_validator("details")
-    @classmethod
     def validate_details(cls, v: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
-        for idx, item in enumerate(v):
-            if not isinstance(item, dict) or "@type" not in item:
-                raise ValueError(f"Item at index {idx} in details must be a dict with a '@type' key, got: {item}")
+        if v is not None:
+            for idx, item in enumerate(v):
+                if not isinstance(item, dict) or "@type" not in item:
+                    raise ValueError(f"Item at index {idx} in details must be a dict with a '@type' key, got: {item}")
         return v
 
 
@@ -39,7 +39,6 @@ class VideoFileMetadata(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     @field_validator("video_duration")
-    @classmethod
     def validate_video_duration(cls, v: str | None) -> str | None:
         if v is not None and not re.match(DURATION_PATTERN, v):
             raise ValueError("Invalid duration format")
@@ -85,7 +84,6 @@ class File(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     @field_validator("size_bytes")
-    @classmethod
     def validate_size_bytes(cls, v: str) -> str:
         try:
             int(v)
