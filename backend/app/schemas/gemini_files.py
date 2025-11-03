@@ -73,7 +73,7 @@ class File(BaseModel):
         alias="sha256Hash", description="Output only. SHA-256 hash of the uploaded bytes.A base64-encoded string."
     )
     uri: str = Field(description="Output only. The uri of the `File`.")
-    download_uri: str = Field(alias="downloadUri", description="Output only. The download uri of the `File`.")
+    download_uri: str | None = Field(default=None, alias="downloadUri", description="Output only. The download uri of the `File`.")
     state: State = Field(description="Output only. Processing state of the File.")
     source: Source = Field(description="Source of the File.")
     error: Status | None = Field(default=None, description="Output only. Error status if File processing failed.")
@@ -83,10 +83,34 @@ class File(BaseModel):
 
     model_config = ConfigDict(populate_by_name=True)
 
-    @field_validator("size_bytes")
-    def validate_size_bytes(cls, v: str) -> str:
+    @field_validator("size_bytes", mode="before")
+    def validate_size_bytes(cls, v: str | int) -> str:
+        if isinstance(v, int):
+            return str(v)
         try:
             int(v)
         except ValueError:
             raise ValueError(f"'size_bytes' must be a string representing a numeric file size in bytes, but got '{v}'")
         return v
+
+
+class UploadFileMetadata(BaseModel):
+    display_name: str | None = Field(
+        default=None,
+        alias="displayName",
+        description='Optional. The human-readable display name for the `File`. The display name must be no more than 512 characters in length, including spaces. Example: "Welcome Image"',
+    )
+    mime_type: str = Field(alias="mimeType", description="MIME type of the file.")
+    size_bytes: str = Field(alias="sizeBytes", description="Size of the file in bytes.")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    @field_validator("size_bytes", mode="before")
+    def convert_size_bytes(cls, v: str | int) -> str:
+        if isinstance(v, int):
+            return str(v)
+        return v
+
+
+class InitialUploadRequest(BaseModel):
+    file: UploadFileMetadata

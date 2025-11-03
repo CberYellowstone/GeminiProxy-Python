@@ -1,5 +1,6 @@
 import { GoogleGenAI } from "@google/genai";
 import type { Command } from '../types/types';
+import { deleteFile, getFile, initiateResumableUpload, uploadChunk } from "./files";
 import { executeGenerateContent, executeStreamGenerateContent } from "./generatingContent";
 import { executeGetModel, executeListModels } from './models';
 
@@ -33,6 +34,15 @@ export const geminiExecutor = {
       case 'streamGenerateContent':
         await executeStreamGenerateContent(command, sendResponse, activeRequests);
         return;
+      // File API Commands
+      case 'initiate_resumable_upload':
+        return initiateResumableUpload(command.payload);
+      case 'upload_chunk':
+        return uploadChunk(command.payload);
+      case 'get_file':
+        return getFile(command.payload);
+      case 'delete_file':
+        return deleteFile(command.payload);
       default:
         const exhaustiveCheck: never = command;
         throw new Error(`Unsupported command type: ${(exhaustiveCheck as any).type}`);
