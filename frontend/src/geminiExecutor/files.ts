@@ -5,7 +5,7 @@ import {
   InitiateResumableUploadPayload,
   UploadChunkPayload,
 } from '../types/files';
-const GOOGLE_API_URL = "https://generativelanguage.googleapis.com/v1beta";
+import { GOOGLE_API_URL } from "./geminiExecutor";
 
 /**
  * Initiates a resumable upload with the Google AI API.
@@ -115,7 +115,7 @@ export async function uploadChunk(payload: UploadChunkPayload): Promise<any> {
  * @returns The file metadata.
  */
 export async function getFile(payload: GetFilePayload): Promise<any> {
-  const response = await fetch(`${GOOGLE_API_URL}/${payload.file_name}`);
+  const response = await fetch(`${GOOGLE_API_URL}/files/${payload.file_name}`);
 
   if (!response.ok) {
     const error = await response.json().catch(() => ({ error: { message: response.statusText } }));
@@ -130,7 +130,7 @@ export async function getFile(payload: GetFilePayload): Promise<any> {
  * @param payload - The payload from the backend command.
  */
 export async function deleteFile(payload: DeleteFilePayload): Promise<void> {
-  const response = await fetch(`${GOOGLE_API_URL}/${payload.file_name}`, {
+  const response = await fetch(`${GOOGLE_API_URL}/files/${payload.file_name}`, {
     method: 'DELETE',
   });
 

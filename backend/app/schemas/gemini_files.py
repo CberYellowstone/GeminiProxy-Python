@@ -69,17 +69,13 @@ class File(BaseModel):
         alias="expirationTime",
         description='Output only. The timestamp of when the `File` will be deleted. Only set if the `File` is scheduled to expire.Uses RFC 3339, where generated output will always be Z-normalized and uses 0, 3, 6 or 9 fractional digits. Offsets other than "Z" are also accepted. Examples: `"2014-10-02T15:01:23Z"`, `"2014-10-02T15:01:23.045123456Z"` or `"2014-10-02T15:01:23+05:30"`.',
     )
-    sha256_hash: str = Field(
-        alias="sha256Hash", description="Output only. SHA-256 hash of the uploaded bytes.A base64-encoded string."
-    )
+    sha256_hash: str = Field(alias="sha256Hash", description="Output only. SHA-256 hash of the uploaded bytes.A base64-encoded string.")
     uri: str = Field(description="Output only. The uri of the `File`.")
     download_uri: str | None = Field(default=None, alias="downloadUri", description="Output only. The download uri of the `File`.")
     state: State = Field(description="Output only. Processing state of the File.")
     source: Source = Field(description="Source of the File.")
     error: Status | None = Field(default=None, description="Output only. Error status if File processing failed.")
-    video_metadata: VideoFileMetadata | None = Field(
-        default=None, alias="videoMetadata", description="Output only. Metadata for a video."
-    )
+    video_metadata: VideoFileMetadata | None = Field(default=None, alias="videoMetadata", description="Output only. Metadata for a video.")
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -114,3 +110,25 @@ class UploadFileMetadata(BaseModel):
 
 class InitialUploadRequest(BaseModel):
     file: UploadFileMetadata
+
+
+class ListFilesPayload(BaseModel):
+    page_size: int = Field(
+        10,
+        alias="pageSize",
+        ge=1,
+        le=100,
+        description="Optional. Maximum number of Files to return per page. If unspecified, defaults to 10. Maximum pageSize is 100.",
+    )
+    page_token: str | None = Field(None, alias="pageToken", description="Optional. A page token from a previous files.list call.")
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class ListFilesResponse(BaseModel):
+    files: list[File] = Field(default_factory=list, description="The list of Files.")
+    next_page_token: str | None = Field(
+        default=None, alias="nextPageToken", description="A token that can be sent as a pageToken into a subsequent files.list call."
+    )
+
+    model_config = ConfigDict(populate_by_name=True)
