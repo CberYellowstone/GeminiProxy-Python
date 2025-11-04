@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 
 from app.api import api_router
 from app.core import manager
+from app.core.config import settings
 from app.core.exceptions import ApiException
 from app.core.file_manager import file_manager
 from app.core.log_utils import format_response_log
@@ -47,23 +48,24 @@ LOGGING_CONFIG = {
     "loggers": {
         "": {  # Root logger
             "handlers": ["rich"],
-            "level": "INFO",
+            "level": settings.LOG_LEVEL,
             "propagate": False,
         },
         "uvicorn.error": {
             "handlers": ["rich"],
-            "level": "INFO",
+            "level": settings.LOG_LEVEL,
             "propagate": False,
         },
         "uvicorn.access": {
             "handlers": ["rich"],
-            "level": "INFO",
+            "level": settings.LOG_LEVEL,
             "propagate": False,
         },
     },
 }
 
 logging.config.dictConfig(LOGGING_CONFIG)
+logging.info(f"应用启动 | 环境: {settings.APP_ENV} | 日志级别: {settings.LOG_LEVEL}")
 
 
 @asynccontextmanager
@@ -84,8 +86,8 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=settings.get_cors_origins(),
+    allow_credentials=settings.CORS_ALLOW_CREDENTIALS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
