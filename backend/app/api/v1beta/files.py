@@ -6,7 +6,7 @@ from app.core import manager
 from app.core.config import settings
 from app.core.exceptions import ApiException
 from app.core.file_manager import file_manager
-from app.core.log_utils import format_request_log, format_response_log
+from app.core.log_utils import Logger
 from app.schemas.gemini_files import File, InitialUploadRequest, ListFilesPayload, ListFilesResponse
 from fastapi import (
     APIRouter,
@@ -50,7 +50,7 @@ async def create_file(
     Initializes a resumable upload session for a file. Returns a proxy upload URL for subsequent chunk uploads.
     """
     request_id = str(uuid.uuid4())
-    logging.info(format_request_log("caller_to_backend", request_id, f"收到上传初始化请求 | 文件: [green]{body.file.display_name}[/green]"))
+    Logger.api_request(request_id, f"文件上传初始化 | {body.file.display_name  or "Unknown"}")
 
     # 验证上传协议头
     if upload_protocol != "resumable" or upload_command != "start":
@@ -76,8 +76,8 @@ async def create_file(
                 detail="Frontend did not return a upload URL.",
             )
 
-        # 创建代理会话（业务逻辑）
-        proxy_session_id = file_manager.create_upload_session(upload_url, body.model_dump(by_alias=True))
+        # 创建代理会话(业务逻辑)
+        proxy_session_id = file_manager.create_upload_session(upload_url, body)
 
         # 生成代理上传 URL
         proxy_upload_url = f"{settings.PROXY_BASE_URL}/upload/v1beta/files/{proxy_session_id}:upload"
@@ -90,7 +90,7 @@ async def create_file(
             },
         )
 
-        logging.info(format_response_log("backend_to_caller", request_id, f"返回上传初始化响应 | 代理URL: [blue]{proxy_upload_url}[/blue]"))
+        Logger.api_response(request_id, f"会话ID: {proxy_session_id} | 返回上传URL")
         return response
 
 
@@ -108,11 +108,7 @@ async def update_file(
     Uploads data chunks for a resumable upload session.
     """
     request_id = str(uuid.uuid4())
-    logging.info(
-        format_request_log(
-            "caller_to_backend", request_id, f"收到文件块上传 | 会话: [cyan]{session_id}[/cyan] | 大小: {content_length} bytes"
-        )
-    )
+    Logger.api_request(request_id, f"文件块上传 | 会话: {session_id[:8]} | {content_length} bytes")
 
     # 验证会话
     session = file_manager.get_upload_session(session_id)
@@ -165,10 +161,8 @@ async def update_file(
         )
 
         # 记录日志
-        log_detail = (
-            f"返回最终块元数据 | 状态: {processed['status']}" if processed["is_final"] else f"返回块上传响应 | 状态: {processed['status']}"
-        )
-        logging.info(format_response_log("backend_to_caller", request_id, log_detail))
+        log_detail = f"上传完成" if processed["is_final"] else f"块已接收"
+        Logger.api_response(request_id, log_detail)
 
         return response
     except ApiException as e:
@@ -190,7 +184,7 @@ async def get_file_chunk(token: str):
     if not chunk_path or not chunk_path.exists():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chunk not found or token invalid.")
 
-    logging.info(f"[bold blue]▶[/bold blue] [dim blue]后端→前端[/dim blue] 发送临时文件块 | 令牌: {token[:8]}...")
+    Logger.event("CHUNK_DOWNLOAD", "发送临时文件块给浏览器", token=token[:8])
     return FileResponse(chunk_path, media_type="application/octet-stream")
 
 
@@ -210,11 +204,11 @@ async def list_files(params: ListFilesPayload = Depends()):
     Lists the metadata for Files owned by the requesting project.
     """
     request_id = str(uuid.uuid4())
-    logging.info(format_request_log("caller_to_backend", request_id, f"收到文件列表请求 | 页大小: {params.page_size}"))
+    Logger.api_request(request_id, f"列出文件 | 页大小: {params.page_size}")
 
     files_response = file_manager.list_files(params.page_size, params.page_token)
 
-    logging.info(format_response_log("backend_to_caller", request_id, f"返回文件列表 | 数量: {len(files_response.get('files', []))}"))
+    Logger.api_response(request_id, f"{len(files_response.get('files', []))} 个文件")
     return files_response
 
 
@@ -229,7 +223,7 @@ async def get_file(request: Request, name: str):
     Gets the metadata for the given File.
     """
     request_id = str(uuid.uuid4())
-    logging.info(format_request_log("caller_to_backend", request_id, f"收到获取文件请求 | 文件: [green]{name}[/green]"))
+    Logger.api_request(request_id, f"获取文件 | {name}")
 
     async with manager.monitored_proxy_request(request_id, request):
         response_payload = await manager.proxy_request(
@@ -242,7 +236,7 @@ async def get_file(request: Request, name: str):
     file_metadata = File.model_validate(response_payload)
     file_manager.save_file_metadata(file_metadata)  # 更新缓存供 list_files 使用
 
-    logging.info(format_response_log("backend_to_caller", request_id, f"返回文件元数据 | 文件: [green]{name}[/green]"))
+    Logger.api_response(request_id, f"文件: {name}")
     return file_metadata
 
 
@@ -256,7 +250,7 @@ async def delete_file(request: Request, name: str):
     Deletes the File.
     """
     request_id = str(uuid.uuid4())
-    logging.info(format_request_log("caller_to_backend", request_id, f"收到删除文件请求 | 文件: [red]{name}[/red]"))
+    Logger.api_request(request_id, f"删除文件 | {name}")
 
     try:
         async with manager.monitored_proxy_request(request_id, request):
@@ -274,5 +268,5 @@ async def delete_file(request: Request, name: str):
     # 删除本地缓存（成功或 404 都删除）
     file_manager.delete_file_metadata(name)
 
-    logging.info(format_response_log("backend_to_caller", request_id, f"删除文件成功 | 文件: [red]{name}[/red]"))
+    Logger.api_response(request_id, "删除成功")
     return Response(status_code=status.HTTP_204_NO_CONTENT)

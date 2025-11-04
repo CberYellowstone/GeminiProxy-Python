@@ -3,7 +3,7 @@ import uuid
 from typing import Annotated
 
 from app.core import manager
-from app.core.log_utils import format_request_log, format_response_log
+from app.core.log_utils import Logger
 from app.schemas import GenerateContentPayload, GenerateContentResponse
 from fastapi import Path, Request
 from fastapi.responses import StreamingResponse
@@ -27,7 +27,7 @@ async def generate_content(
     Generates a model response given an input GenerateContentRequest. Refer to the text generation guide for detailed usage information. Input capabilities differ between models, including tuned models. Refer to the model guide and tuning guide for details.
     """
     request_id = str(uuid.uuid4())
-    logging.info(format_request_log("caller_to_backend", request_id, f"收到内容生成请求 | 模型: [cyan]{model}[/cyan]"))
+    Logger.api_request(request_id, f"生成内容 | {model}")
     async with manager.monitored_proxy_request(request_id, request):
         response_data = await manager.proxy_request(
             command_type="generateContent",
@@ -36,7 +36,7 @@ async def generate_content(
             request_id=request_id,
             is_streaming=False,
         )
-    logging.info(format_response_log("backend_to_caller", request_id, f"返回内容生成响应 | 模型: [cyan]{model}[/cyan]"))
+    Logger.api_response(request_id, "生成完成")
     return response_data
 
 
@@ -54,17 +54,22 @@ async def stream_generate_content(
     Generates a streamed response from the model given an input GenerateContentRequest.
     """
     request_id = str(uuid.uuid4())
-    logging.info(format_request_log("caller_to_backend", request_id, f"收到流式内容生成请求 | 模型: [cyan]{model}[/cyan]"))
+    Logger.api_request(request_id, f"流式生成 | {model}")
+
     async def generator():
-        async with manager.monitored_proxy_request(request_id, request):
-            response_generator = await manager.proxy_request(
-                command_type="streamGenerateContent",
-                payload={"model": model, "payload": payload.model_dump(by_alias=True, exclude_none=True)},
-                request=request,
-                request_id=request_id,
-                is_streaming=True,
-            )
-            async for chunk in response_generator:
-                yield chunk
+        try:
+            async with manager.monitored_proxy_request(request_id, request):
+                response_generator = await manager.proxy_request(
+                    command_type="streamGenerateContent",
+                    payload={"model": model, "payload": payload.model_dump(by_alias=True, exclude_none=True)},
+                    request=request,
+                    request_id=request_id,
+                    is_streaming=True,
+                )
+                async for chunk in response_generator:
+                    yield chunk
+        finally:
+            # 流式传输完成后记录日志
+            Logger.api_response(request_id, "流式生成完成")
 
     return StreamingResponse(generator())

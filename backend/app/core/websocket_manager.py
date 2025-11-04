@@ -6,10 +6,9 @@ from typing import Any
 
 from app.core.config import settings
 from app.core.exceptions import ApiException
-from app.core.log_utils import format_request_log
+from app.core.log_utils import Logger
 from fastapi import HTTPException, Request, WebSocket, status
 from pydantic import BaseModel
-from rich.markup import escape
 
 
 class ConnectionManager:
@@ -23,6 +22,9 @@ class ConnectionManager:
 
         # 新增：追踪每个 client 正在处理的请求集合
         self.client_active_requests: dict[str, set[str]] = {}
+
+        # 新增：追踪流式请求的包计数（用于日志优化）
+        self.streaming_chunk_count: dict[str, int] = {}
 
         self._client_ids: list[str] = []
         self._next_client_index: int = 0
@@ -38,7 +40,7 @@ class ConnectionManager:
         # 清理该客户端的所有活跃请求
         if client_id in self.client_active_requests:
             request_ids = list(self.client_active_requests[client_id])
-            logging.info(f"[DISCONNECT] Cancelling {len(request_ids)} requests for client {client_id}")
+            Logger.event("DISCONNECT", f"取消 {len(request_ids)} 个请求", client_id=client_id)
 
             # 使用 cancel_request 统一清理
             for request_id in request_ids:
@@ -57,23 +59,44 @@ class ConnectionManager:
         """处理从前端收到的响应消息"""
         payload = message.get("payload", {})
         request_id = message.get("id")
+
         if request_id:
             is_finished = payload.get("is_finished", "N/A")
-            logging.debug(f"DEBUG: Received message for request {request_id}. Is finished: {is_finished}.")
+            Logger.debug(f"接收消息 {request_id} | 完成: {is_finished}")
 
         # 检查是否为流式响应
         if request_id in self.streaming_responses:
             queue = self.streaming_responses[request_id]
             if payload.get("is_streaming"):
+                # 追踪包计数
+                if request_id not in self.streaming_chunk_count:
+                    self.streaming_chunk_count[request_id] = 0
+                self.streaming_chunk_count[request_id] += 1
+                chunk_num = self.streaming_chunk_count[request_id]
+
                 if "chunk" in payload:
                     queue.put_nowait(payload["chunk"])
+
+                client_id = self.request_to_client.get(request_id, "unknown")
+
                 if payload.get("is_finished"):
                     queue.put_nowait(None)
+                    # 记录最后一个包
+                    Logger.ws_receive(request_id, client_id, is_stream_end=True, total_chunks=chunk_num, data=message)
                     self._cleanup_request(request_id)  # 正常完成时清理
+                elif chunk_num == 1:
+                    # 记录第一个包
+                    Logger.ws_receive(request_id, client_id, is_stream_start=True, data=message)
+                else:
+                    # 中间包: INFO 级别不显示, DEBUG 级别显示
+                    Logger.ws_receive(request_id, client_id, is_stream_middle=True, data=message)
             return
 
         # 处理非流式响应
         if request_id and request_id in self.pending_responses:
+            # 记录非流式响应
+            client_id = self.request_to_client.get(request_id, "unknown")
+            Logger.ws_receive(request_id, client_id, data=message)
             future = self.pending_responses.pop(request_id)
             if message.get("status", {}).get("error"):
                 code = message["status"].get("code")
@@ -107,13 +130,13 @@ class ConnectionManager:
         client_id = self.get_next_client()
         self.request_to_client[request_id] = client_id
         self.client_active_requests[client_id].add(request_id)
-        logging.debug(f"Registered request {request_id} for client {client_id}")
+        Logger.debug(f"注册请求 {request_id} → {client_id}")
 
         try:
             yield
         finally:
             if await request.is_disconnected():
-                logging.info(f"[DISCONNECT] Client disconnected for {request_id}")
+                Logger.event("DISCONNECT", "客户端断开连接", request_id=request_id)
                 await self.cancel_request(request_id)
             else:
                 # For non-streaming requests, the future is cleaned up when the response is received.
@@ -149,15 +172,7 @@ class ConnectionManager:
             "payload": payload_to_send,
         }
 
-        logging.info(
-            format_request_log(
-                "backend_to_browser",
-                request_id,
-                f"发往客户端 [bold cyan]{client_id}[/bold cyan] | "
-                f"类型: [magenta]{command_type}[/magenta] | "
-                f"数据: [grey50]{escape(str(command))}[/grey50]",
-            )
-        )
+        Logger.ws_send(request_id, client_id, command_type, command=command)
 
         if is_streaming:
             return await self._handle_streaming_request(websocket, command, request_id, request)
@@ -210,7 +225,7 @@ class ConnectionManager:
                 while True:
                     # Check for disconnect before waiting for the next item
                     if await request.is_disconnected():
-                        logging.info(f"[DISCONNECT] Client disconnected during stream for {request_id}")
+                        Logger.event("DISCONNECT", "流式传输中断", request_id=request_id)
                         # No need to call cancel_request here, the context manager will handle it
                         break
 
@@ -244,11 +259,11 @@ class ConnectionManager:
         Returns:
             bool: 取消操作是否成功启动
         """
-        logging.debug(f"[CANCEL] Attempting to cancel request {request_id}")
+        Logger.debug(f"尝试取消请求 {request_id}")
 
         # 步骤 1：幂等性检查
         if request_id not in self.request_to_client:
-            logging.debug(f"[CANCEL] Request {request_id} not found or already cancelled")
+            Logger.debug(f"请求 {request_id} 未找到或已取消")
             return False
 
         # 步骤 2：获取处理该请求的客户端
@@ -264,13 +279,13 @@ class ConnectionManager:
             }
             try:
                 await websocket.send_json(cancel_message)
-                logging.info(f"[CANCEL] Sent cancel signal for {request_id} to {client_id}")
+                Logger.event("CANCEL", "发送取消信号", request_id=request_id, client_id=client_id)
                 cancel_signal_sent = True
             except Exception as e:
-                logging.error(f"[CANCEL] Failed to send cancel signal: {e}")
+                Logger.error("发送取消信号失败", exc=e, request_id=request_id, client_id=client_id)
                 # 即使发送失败，也要继续清理后端资源
         else:
-            logging.warning(f"[CANCEL] Client {client_id} not connected, cannot send signal")
+            Logger.warning("客户端未连接，无法发送取消信号", client_id=client_id)
 
         # 步骤 4：清理后端资源（必须执行）
         self._cleanup_request(request_id)
@@ -309,8 +324,13 @@ class ConnectionManager:
                 future.cancel()
             cleaned_items.append("future")
 
+        # 清理 4：流式包计数
+        if request_id in self.streaming_chunk_count:
+            self.streaming_chunk_count.pop(request_id)
+            cleaned_items.append("chunk_count")
+
         if cleaned_items:
-            logging.debug(f"[CLEANUP] Cleaned {', '.join(cleaned_items)} for {request_id}")
+            Logger.debug(f"清理资源 {request_id} | {', '.join(cleaned_items)}")
 
 
 manager = ConnectionManager()

@@ -16,7 +16,9 @@ from pathlib import Path
 from typing import Any
 
 from app.core.config import settings
+from app.core.log_utils import Logger
 from app.schemas.gemini_files import File as FileMetadata
+from app.schemas.gemini_files import InitialUploadRequest
 
 # ============================================================================
 # 数据类
@@ -29,13 +31,13 @@ class UploadSession:
 
     Attributes:
         real_upload_url: 真实的 Gemini 上传 URL
-        metadata: 文件元数据
+        metadata: 文件元数据请求对象
         created_at: 会话创建时间
         temp_chunks: 临时文件块路径列表
     """
 
     real_upload_url: str
-    metadata: dict[str, Any]
+    metadata: InitialUploadRequest
     created_at: datetime
     temp_chunks: list[Path] = field(default_factory=list)
 
@@ -74,18 +76,18 @@ class FileManager:
         self.temp_chunks_dir = Path(settings.TEMP_CHUNKS_DIR)
         self.temp_chunks_dir.mkdir(parents=True, exist_ok=True)
 
-        logging.info(f"Temporary chunk directory set to: {self.temp_chunks_dir}")
+        Logger.event("INIT", "文件管理器初始化", temp_dir=str(self.temp_chunks_dir))
 
     # ========================================================================
     # 上传会话管理
     # ========================================================================
 
-    def create_upload_session(self, real_upload_url: str, metadata: dict) -> str:
+    def create_upload_session(self, real_upload_url: str, metadata: InitialUploadRequest) -> str:
         """创建新的上传会话
 
         Args:
             real_upload_url: 真实的 Gemini 上传 URL
-            metadata: 文件元数据
+            metadata: 文件元数据请求对象
 
         Returns:
             代理会话 ID
@@ -97,8 +99,8 @@ class FileManager:
             created_at=datetime.now(),
         )
 
-        display_name = metadata.get("file", {}).get("displayName", "Unknown")
-        logging.info(f"Created upload session {proxy_session_id} for {display_name}")
+        display_name = metadata.file.display_name or "Unknown"
+        Logger.event("SESSION_CREATE", "创建上传会话", session_id=proxy_session_id, file=display_name)
 
         return proxy_session_id
 
@@ -181,7 +183,7 @@ class FileManager:
                     f.write(chunk)
             return chunk_path
         except Exception as e:
-            logging.error(f"Failed to write chunk to temp file: {e}")
+            Logger.error("保存文件块失败", exc=e, chunk_path=str(chunk_path), session_id=proxy_session_id)
             # 清理失败的文件
             if chunk_path.exists():
                 chunk_path.unlink()
@@ -213,7 +215,7 @@ class FileManager:
             # 清理会话
             self.cleanup_session(proxy_session_id)
 
-            logging.info(f"Upload completed for file: {file_metadata.name}")
+            Logger.event("UPLOAD_COMPLETE", "文件上传完成", file=file_metadata.name, session_id=proxy_session_id)
 
         # 序列化响应内容
         content = json.dumps(response_body) if isinstance(response_body, dict) else str(response_body)
@@ -267,7 +269,7 @@ class FileManager:
             file: 文件元数据对象
         """
         self.file_metadata_store[file.name] = file
-        logging.info(f"Saved metadata for file: {file.name}")
+        Logger.event("METADATA_SAVE", "保存文件元数据", file=file.name)
 
     def get_file_metadata(self, file_name: str) -> FileMetadata | None:
         """从缓存获取文件元数据
@@ -331,7 +333,7 @@ class FileManager:
 
         if file_name in self.file_metadata_store:
             del self.file_metadata_store[file_name]
-            logging.info(f"Deleted metadata for file: {file_name}")
+            Logger.event("METADATA_DELETE", "删除文件元数据", file=file_name)
             return True
         return False
 
@@ -353,9 +355,9 @@ class FileManager:
                     if chunk_path.exists():
                         chunk_path.unlink()
                 except OSError as e:
-                    logging.error(f"Error deleting temp chunk {chunk_path}: {e}")
+                    Logger.error("删除临时文件块失败", exc=e, chunk_path=str(chunk_path), session_id=proxy_session_id)
 
-            logging.info(f"Cleaned up session {proxy_session_id}")
+            Logger.event("SESSION_CLEANUP", "清理上传会话", session_id=proxy_session_id, chunks_deleted=len(session.temp_chunks))
 
     async def periodic_cleanup_task(self):
         """定期清理过期的上传会话
@@ -374,7 +376,7 @@ class FileManager:
             ]
 
             if expired_sessions:
-                logging.info(f"Found {len(expired_sessions)} expired sessions to clean up.")
+                Logger.event("PERIODIC_CLEANUP", "发现过期会话", count=len(expired_sessions))
                 for session_id in expired_sessions:
                     self.cleanup_session(session_id)
 
@@ -386,9 +388,9 @@ class FileManager:
         try:
             if self.temp_chunks_dir.exists():
                 shutil.rmtree(self.temp_chunks_dir)
-                logging.info(f"Successfully removed temporary directory: {self.temp_chunks_dir}")
+                Logger.event("SHUTDOWN_CLEANUP", "删除临时目录", temp_dir=str(self.temp_chunks_dir))
         except OSError as e:
-            logging.error(f"Error removing temporary directory {self.temp_chunks_dir}: {e}")
+            Logger.error("删除临时目录失败", exc=e, temp_dir=str(self.temp_chunks_dir))
 
 
 # ============================================================================

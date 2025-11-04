@@ -1,81 +1,195 @@
 """
-日志工具模块 - 定义清晰的网络包方向标识符
+统一日志工具模块
+提供简洁、一致的日志接口，适合小型项目
 """
 
-# 定义四种网络包方向的标识符
-# 使用 rich 的颜色标记来增强可读性
+import logging
+
+from rich.logging import RichHandler
+
+# ============================================================================
+# 日志系统配置
+# ============================================================================
 
 
-class LogDirection:
-    """日志方向标识符"""
-
-    # 1. 调用者 → 后端：外部API调用者发送请求到后端
-    CALLER_TO_BACKEND = "[bold yellow]◀[/bold yellow] [dim yellow]调用者→后端[/dim yellow]"
-
-    # 2. 后端 → 调用者：后端响应给外部API调用者
-    BACKEND_TO_CALLER = "[bold yellow]▶[/bold yellow] [dim yellow]后端→调用者[/dim yellow]"
-
-    # 3. 后端 → 浏览器：后端通过WebSocket发送到浏览器前端
-    BACKEND_TO_BROWSER = "[bold cyan]▶[/bold cyan] [dim cyan]后端→浏览器[/dim cyan]"
-
-    # 4. 浏览器 → 后端：浏览器前端通过WebSocket发送到后端
-    BROWSER_TO_BACKEND = "[bold cyan]◀[/bold cyan] [dim cyan]浏览器→后端[/dim cyan]"
-
-
-# 快捷方法
-def log_direction(direction: str) -> str:
+def setup_logging(log_level: str = "INFO"):
     """
-    根据方向类型返回对应的标识符
+    配置统一的日志系统
 
     Args:
-        direction: 方向类型 ('caller_to_backend', 'backend_to_caller',
-                           'backend_to_browser', 'browser_to_backend')
-
-    Returns:
-        格式化的方向标识符字符串
+        log_level: 日志级别 (DEBUG, INFO, WARNING, ERROR)
     """
-    direction_map = {
-        "caller_to_backend": LogDirection.CALLER_TO_BACKEND,
-        "backend_to_caller": LogDirection.BACKEND_TO_CALLER,
-        "backend_to_browser": LogDirection.BACKEND_TO_BROWSER,
-        "browser_to_backend": LogDirection.BROWSER_TO_BACKEND,
+
+    # 过滤 ping/pong 噪音日志
+    class PingPongFilter(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            message = record.getMessage().lower()
+            return not any(kw in message for kw in ["ping", "pong", "keepalive"])
+
+    # 创建 Rich 处理器
+    handler = RichHandler(rich_tracebacks=True, markup=True, log_time_format="[%Y-%m-%d %H:%M:%S]")
+    handler.addFilter(PingPongFilter())
+
+    # 配置根日志记录器
+    root_logger = logging.getLogger()
+    root_logger.setLevel(log_level)
+    root_logger.handlers.clear()  # 清除现有处理器
+    root_logger.addHandler(handler)
+
+    # 同步 uvicorn 日志级别
+    for logger_name in ["uvicorn.error", "uvicorn.access"]:
+        logger = logging.getLogger(logger_name)
+        logger.handlers.clear()
+        logger.addHandler(handler)
+        logger.setLevel(log_level)
+        logger.propagate = False
+
+
+# ============================================================================
+# 统一日志接口
+# ============================================================================
+
+
+class Logger:
+    """
+    统一的日志记录器
+    封装所有日志格式，提供简洁的调用接口
+
+    日志级别说明：
+    - INFO: 显示关键信息（ID、方向、类型），不显示具体数据
+    - DEBUG: 显示完整的数据包内容
+    """
+
+    # 方向标识符
+    _DIRECTIONS = {
+        "api_request": "[bold yellow]▶[/bold yellow] [dim yellow]收到API请求[/dim yellow]",
+        "api_response": "[bold yellow]◀[/bold yellow] [dim yellow]发送API响应[/dim yellow]",
+        "ws_send": "[bold cyan]◀[/bold cyan] [dim cyan]传递至浏览器[/dim cyan]",
+        "ws_receive": "[bold cyan]▶[/bold cyan] [dim cyan]接收自浏览器[/dim cyan]",
     }
-    return direction_map.get(direction, "")
 
+    @staticmethod
+    def api_request(request_id: str, message: str, **debug_data):
+        """
+        API请求日志
 
-def format_request_log(direction: str, request_id: str, details: str = "") -> str:
-    """
-    格式化请求日志
+        Args:
+            request_id: 请求ID
+            message: INFO级别显示的消息
+            **debug_data: DEBUG级别显示的详细数据
+        """
+        logging.info(f"{Logger._DIRECTIONS['api_request']} [bold green]{request_id}[/bold green] {message}")
+        if debug_data and logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.debug(f"  → 请求数据: {debug_data}")
 
-    Args:
-        direction: 方向类型
-        request_id: 请求ID
-        details: 额外的详细信息
+    @staticmethod
+    def api_response(request_id: str, message: str, **debug_data):
+        """
+        API响应日志
 
-    Returns:
-        格式化的日志字符串
-    """
-    dir_marker = log_direction(direction)
-    log_msg = f"{dir_marker} [bold]请求[/bold] [bold green]{request_id}[/bold green]"
-    if details:
-        log_msg += f" {details}"
-    return log_msg
+        Args:
+            request_id: 请求ID
+            message: INFO级别显示的消息
+            **debug_data: DEBUG级别显示的详细数据
+        """
+        logging.info(f"{Logger._DIRECTIONS['api_response']} [bold green]{request_id}[/bold green] {message}")
+        if debug_data and logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.debug(f"  ← 响应数据: {debug_data}")
 
+    @staticmethod
+    def ws_send(request_id: str, client_id: str, command_type: str | None = None, **debug_data):
+        """
+        WebSocket发送日志
 
-def format_response_log(direction: str, request_id: str, details: str = "") -> str:
-    """
-    格式化响应日志
+        Args:
+            request_id: 请求ID
+            client_id: 客户端ID
+            command_type: 命令类型
+            **debug_data: DEBUG级别显示的完整数据包
+        """
+        msg = f"[bold green]{request_id}[/bold green] → [cyan]{client_id}[/cyan]"
+        if command_type:
+            msg += f" | 类型: [magenta]{command_type}[/magenta]"
+        logging.info(f"{Logger._DIRECTIONS['ws_send']} {msg}")
+        if debug_data and logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.debug(f"  ◀ 发送数据包: {debug_data}")
 
-    Args:
-        direction: 方向类型
-        request_id: 请求ID
-        details: 额外的详细信息
+    @staticmethod
+    def ws_receive(
+        request_id: str,
+        client_id: str,
+        is_stream_start: bool = False,
+        is_stream_end: bool = False,
+        is_stream_middle: bool = False,
+        total_chunks: int | None = None,
+        **debug_data,
+    ):
+        """
+        WebSocket接收日志
 
-    Returns:
-        格式化的日志字符串
-    """
-    dir_marker = log_direction(direction)
-    log_msg = f"{dir_marker} [bold]响应[/bold] [bold green]{request_id}[/bold green]"
-    if details:
-        log_msg += f" {details}"
-    return log_msg
+        Args:
+            request_id: 请求ID
+            client_id: 客户端ID
+            is_stream_start: 是否为流式响应的第一个包
+            is_stream_end: 是否为流式响应的最后一个包
+            is_stream_middle: 是否为流式响应的中间包(INFO级别不显示,DEBUG显示)
+            total_chunks: 流式响应总包数(仅在最后一个包时提供)
+            **debug_data: DEBUG级别显示的完整数据包
+        """
+        msg = f"[bold green]{request_id}[/bold green] ← [cyan]{client_id}[/cyan]"
+        if is_stream_start:
+            msg += " | [yellow]流式开始[/yellow]"
+        elif is_stream_end:
+            msg += f" | [yellow]流式结束[/yellow] (共 {total_chunks} 个包)"
+
+        # 中间包只在 DEBUG 级别显示 INFO 格式的日志
+        if is_stream_middle:
+            if logging.getLogger().isEnabledFor(logging.DEBUG):
+                logging.info(f"{Logger._DIRECTIONS['ws_receive']} {msg}")
+        else:
+            # 首包、尾包、非流式包都正常显示
+            logging.info(f"{Logger._DIRECTIONS['ws_receive']} {msg}")
+
+        if debug_data and logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.debug(f"  ▶ 接收数据包: {debug_data}")
+
+    @staticmethod
+    def event(category: str, message: str, **context):
+        """业务事件日志"""
+        ctx = " | ".join(f"{k}: [cyan]{v}[/cyan]" for k, v in context.items())
+        log_msg = f"[bold magenta][{category}][/bold magenta] {message}"
+        if ctx:
+            log_msg += f" | {ctx}"
+        logging.info(log_msg)
+
+    @staticmethod
+    def error(message: str, exc: Exception | None = None, **context):
+        """错误日志（带异常栈）"""
+        ctx = " | ".join(f"{k}: [yellow]{v}[/yellow]" for k, v in context.items())
+        log_msg = f"[bold red]错误[/bold red] {message}"
+        if ctx:
+            log_msg += f" | {ctx}"
+
+        if exc:
+            logging.exception(log_msg, exc_info=exc)
+        else:
+            logging.error(log_msg)
+
+    @staticmethod
+    def info(message: str):
+        """普通信息日志"""
+        logging.info(message)
+
+    @staticmethod
+    def debug(message: str):
+        """调试日志"""
+        logging.debug(message)
+
+    @staticmethod
+    def warning(message: str, **context):
+        """警告日志"""
+        ctx = " | ".join(f"{k}: [yellow]{v}[/yellow]" for k, v in context.items())
+        log_msg = f"[bold orange]警告[/bold orange] {message}"
+        if ctx:
+            log_msg += f" | {ctx}"
+        logging.warning(log_msg)
