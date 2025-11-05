@@ -43,15 +43,6 @@ app.add_middleware(
 )
 
 
-# PNA
-@app.middleware("http")
-async def add_pna_header(request: Request, call_next):
-    response = await call_next(request)
-    if request.method == "OPTIONS":
-        response.headers["Access-Control-Allow-Private-Network"] = "true"
-    return response
-
-
 @app.exception_handler(ApiException)
 async def api_exception_handler(request: Request, exc: ApiException):
     return JSONResponse(
