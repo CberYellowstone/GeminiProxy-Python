@@ -174,7 +174,7 @@ class ConnectionManager:
             # 在这里实现全局重置逻辑
             error_detail = e.detail or {}
             error_message = error_detail.get("message", "").lower()
-            
+
             # 检查是否是文件未找到的特定错误
             if "not found" in error_message or "file not found" in error_message:
                 # 尝试从命令的 payload 中找到 file_name
@@ -185,7 +185,7 @@ class ConnectionManager:
                         Logger.warning("检测到文件过期/未找到，触发全局重置", file_name=file_name, sha256=sha256)
                         file_manager.reset_replication_map(sha256)
                         # 标记异常，以便上层进行同步重建
-                        e.is_resettable = True
+                        e.sha256_to_reset = sha256
 
             raise e
         except Exception as e:
@@ -249,44 +249,52 @@ class ConnectionManager:
         """
         request_id = str(uuid.uuid4())
         
-        # 1. 解析文件引用 (这是一个简化的例子，实际需要更复杂的解析)
-        file_name = payload.get("payload", {}).get("contents", [{}])[0].get("fileData", {}).get("fileName")
+        # 注意：这个解析逻辑非常脆弱，仅用于演示。生产代码需要更健壮的解析器。
+        original_file_name = None
+        try:
+            original_file_name = payload["payload"]["contents"][0]["fileData"]["fileName"]
+        except (KeyError, IndexError):
+            pass
 
-        client_id = self.get_next_client() # 默认轮询
+        client_id = self.get_next_client()  # 默认轮询
         effective_payload = payload
 
-        if file_name:
-            sha256 = file_manager.get_sha256_by_filename(file_name)
+        if original_file_name:
+            sha256 = file_manager.get_sha256_by_filename(original_file_name)
             if sha256:
                 entry = file_manager.get_metadata_entry(sha256)
                 if entry:
                     # a. 检查轮询选中的客户端是否就绪
                     if client_id in entry.replication_map and entry.replication_map[client_id].get("status") == "synced":
-                        # 完美命中，直接使用
-                        pass
+                        pass  # 完美命中，直接使用
                     else:
                         # b. 未命中，执行即时回退
                         found_synced = False
                         for cid, data in entry.replication_map.items():
                             if data.get("status") == "synced" and cid in self.active_connections:
                                 Logger.debug(f"即时回退: {client_id} -> {cid}", request_id=request_id)
-                                # 触发后台异步复制
                                 self.trigger_async_replication(sha256, client_id)
-                                client_id = cid # 切换到已同步的客户端
+                                client_id = cid  # 切换到已同步的客户端
                                 found_synced = True
                                 break
-                        
+
                         if not found_synced:
-                            # c. 没有找到任何已同步的客户端，可能都离线了，进入同步重建
+                            # c. 没有找到任何已同步的客户端，执行同步重建
                             Logger.warning("找不到任何已同步的客户端，执行同步重建", sha256=sha256, request_id=request_id)
-                            # 这个流程比较复杂，暂时抛出异常让上层处理
-                            raise ApiException(status_code=503, detail="No available client has the required file. Please try again.")
+                            try:
+                                new_file, new_client_id = await self._synchronously_rebuild_file(sha256)
+                                client_id = new_client_id
+                                # 更新 payload 以使用新的文件名
+                                payload["payload"]["contents"][0]["fileData"]["fileName"] = new_file["name"]
+                            except Exception as rebuild_exc:
+                                Logger.error("同步重建失败", exc=rebuild_exc, sha256=sha256)
+                                raise ApiException(
+                                    status_code=503, detail="No available client has the required file, and rebuild failed."
+                                )
 
                     # d. 改写 payload
                     final_file_name = entry.replication_map[client_id].get("name")
-                    # (这是一个简化的改写，实际需要深入payload结构)
                     effective_payload["payload"]["contents"][0]["fileData"]["fileName"] = final_file_name
-
 
         # 实际执行请求
         try:
@@ -300,14 +308,29 @@ class ConnectionManager:
                     request=request,
                 )
         except ApiException as e:
-            if getattr(e, "is_resettable", False):
-                # 捕获到文件过期错误，触发同步重建
-                Logger.error("捕获到可重置的文件错误，将尝试同步重建", request_id=request_id)
-                # TODO: 在这里实现完整的同步重建逻辑
-                # 1. 轮询选择一个新客户端
-                # 2. 指挥它重新上传
-                # 3. 用新的 file_name 再次尝试 handle_api_request
-                raise HTTPException(status_code=500, detail="File expired, reconstruction not yet implemented.")
+            if sha256_to_reset := getattr(e, "sha256_to_reset", None):
+                Logger.error("捕获到可重置的文件错误，将尝试同步重建", request_id=request_id, sha256=sha256_to_reset)
+                try:
+                    # 1. 同步重建
+                    new_file, new_client_id = await self._synchronously_rebuild_file(sha256_to_reset)
+
+                    # 2. 更新 payload
+                    effective_payload["payload"]["contents"][0]["fileData"]["fileName"] = new_file["name"]
+
+                    # 3. 使用新的客户端和 payload 重试请求
+                    Logger.event("RETRY_REQUEST", "使用重建的文件重试请求", request_id=request_id)
+                    async with self.monitored_proxy_request(request_id, request, new_client_id):
+                        return await self.proxy_request(
+                            command_type=command_type,
+                            payload=effective_payload,
+                            request_id=request_id,
+                            client_id=new_client_id,
+                            is_streaming=is_streaming,
+                            request=request,
+                        )
+                except Exception as rebuild_exc:
+                    Logger.error("重试请求在同步重建后失败", exc=rebuild_exc, request_id=request_id)
+                    raise HTTPException(status_code=500, detail=f"File expired, and reconstruction failed: {rebuild_exc}")
             raise
 
 
@@ -357,6 +380,49 @@ class ConnectionManager:
         except Exception as e:
             file_manager.update_replication_status(sha256, client_id, "failed")
             Logger.error("异步文件复制失败", exc=e, sha256=sha256, client_id=client_id)
+
+    async def _synchronously_rebuild_file(self, sha256: str) -> tuple[dict, str]:
+        """
+        同步重建文件：轮询选择一个客户端，阻塞式地指挥它重新上传文件。
+        """
+        request_id = f"rebuild-{sha256[:8]}-{uuid.uuid4()}"
+        Logger.event("REBUILD_START", "开始同步文件重建", sha256=sha256)
+
+        entry = file_manager.get_metadata_entry(sha256)
+        if not entry:
+            raise ValueError(f"Cannot rebuild file: metadata not found for sha256 {sha256}")
+
+        client_id = self.get_next_client()
+
+        token = "placeholder_token"
+        download_url = f"{settings.PROXY_BASE_URL}/files/internal/{sha256}/{token}:download"
+
+        try:
+            response_payload = await self.proxy_request(
+                command_type="upload_from_url",
+                payload={
+                    "download_url": download_url,
+                    "file_metadata": {
+                        "name": entry.original_filename,
+                        "displayName": entry.original_filename,
+                        "mimeType": entry.mime_type,
+                    },
+                },
+                request_id=request_id,
+                client_id=client_id,
+            )
+            gemini_file = response_payload.get("file")
+            if not gemini_file:
+                raise ApiException(status_code=500, detail="Frontend did not return a file object during rebuild.")
+
+            file_manager.update_replication_status(sha256, client_id, "synced", gemini_file)
+            Logger.event("REBUILD_SUCCESS", "同步文件重建成功", sha256=sha256, client_id=client_id)
+            return gemini_file, client_id
+
+        except Exception as e:
+            file_manager.update_replication_status(sha256, client_id, "failed")
+            Logger.error("同步文件重建失败", exc=e, sha256=sha256, client_id=client_id)
+            raise  # 将异常向上抛出
 
 
 manager = ConnectionManager()
