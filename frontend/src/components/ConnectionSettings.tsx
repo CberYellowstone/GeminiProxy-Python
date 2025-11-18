@@ -22,6 +22,12 @@ const ConnectionSettings = ({
   onWebsocketUrlChange,
   isEditable,
 }: SettingsModalProps) => {
+  const [apiKey, setApiKey] = React.useState(localStorage.getItem('gemini-api-key') || '');
+
+  const handleApiKeyChange = (newKey: string) => {
+    setApiKey(newKey);
+    localStorage.setItem('gemini-api-key', newKey);
+  };
   if (!isOpen) {
     return null;
   }
@@ -71,6 +77,25 @@ const ConnectionSettings = ({
                       className="block w-full rounded-md border-0 bg-white/5 py-2 px-3 text-white ring-1 ring-inset ring-white/10 focus:ring-2 focus:ring-inset focus:ring-indigo-500 sm:text-sm sm:leading-6 placeholder:text-gray-400 disabled:cursor-not-allowed disabled:bg-gray-700/50 disabled:text-gray-400 transition-colors"
                       placeholder="e.g., ws://localhost:8000/ws"
                       aria-label="WebSocket URL"
+                    />
+                  </div>
+                </div>
+
+                {/* API Key Section */}
+                <div>
+                  <label htmlFor="modalApiKey" className="block text-sm font-medium leading-6 text-gray-300">
+                    Gemini API Key (Optional for Proxy, Required for Direct Test)
+                  </label>
+                  <div className="mt-2">
+                    <input
+                      type="password"
+                      name="modalApiKey"
+                      id="modalApiKey"
+                      value={apiKey}
+                      onChange={(e) => handleApiKeyChange(e.target.value)}
+                      className="block w-full rounded-md border-0 bg-white/5 py-2 px-3 text-white ring-1 ring-inset ring-white/10 focus:ring-2 focus:ring-inset focus:ring-indigo-500 sm:text-sm sm:leading-6 placeholder:text-gray-400 transition-colors"
+                      placeholder="Enter your Gemini API Key"
+                      aria-label="Gemini API Key"
                     />
                   </div>
                 </div>

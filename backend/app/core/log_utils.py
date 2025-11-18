@@ -4,6 +4,7 @@
 """
 
 import logging
+from typing import Optional
 
 from rich.logging import RichHandler
 
@@ -97,7 +98,7 @@ class Logger:
             logging.debug(f"  ← 响应数据: {debug_data}")
 
     @staticmethod
-    def ws_send(request_id: str, client_id: str, command_type: str | None = None, **debug_data):
+    def ws_send(request_id: str, client_id: str, command_type: Optional[str] = None, **debug_data):
         """
         WebSocket发送日志
 
@@ -121,7 +122,7 @@ class Logger:
         is_stream_start: bool = False,
         is_stream_end: bool = False,
         is_stream_middle: bool = False,
-        total_chunks: int | None = None,
+        total_chunks: Optional[int] = None,
         **debug_data,
     ):
         """
@@ -163,7 +164,7 @@ class Logger:
         logging.info(log_msg)
 
     @staticmethod
-    def error(message: str, exc: Exception | None = None, **context):
+    def error(message: str, exc: Optional[Exception] = None, **context):
         """错误日志（带异常栈）"""
         ctx = " | ".join(f"{k}: [yellow]{v}[/yellow]" for k, v in context.items())
         log_msg = f"[bold red]错误[/bold red] {message}"

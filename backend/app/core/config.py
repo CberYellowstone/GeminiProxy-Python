@@ -50,7 +50,7 @@ class Settings(BaseSettings):
     # ===========================
     # 文件缓存配置 (方案 B)
     # ===========================
-    FILE_CACHE_DIR: str = "./file_cache"  # 文件内容缓存目录
+    FILE_CACHE_DIR: str = "../file_cache"  # 文件内容缓存目录 (移出 backend 目录以避免触发重载)
     FILE_CACHE_QUOTA_MB: int = 1024  # 缓存配额（MB）
     FILE_CACHE_CLEANUP_INTERVAL: int = 600  # 缓存清理任务间隔（秒）
 

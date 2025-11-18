@@ -55,13 +55,18 @@ class FileManager:
     def __init__(self):
         """初始化文件管理器"""
         # 文件缓存目录
-        self.file_cache_dir = Path(settings.FILE_CACHE_DIR)
+        self.file_cache_dir = Path(settings.FILE_CACHE_DIR).resolve()
+        # 确保缓存目录在项目根目录之外，或者在 .gitignore 中，避免触发重载
+        # 这里我们假设 settings.FILE_CACHE_DIR 配置正确，或者我们可以在这里强制使用绝对路径
+        # 如果它是相对路径，确保它不在被监控的目录中，或者被忽略
         self.file_cache_dir.mkdir(parents=True, exist_ok=True)
 
         # 核心元数据存储 (sha256 -> FileCacheEntry)
         self.metadata_store: Dict[str, FileCacheEntry] = {}
         # 反向映射 (gemini_file_name -> sha256)
         self.reverse_mapping: Dict[str, str] = {}
+        # 临时上传会话 (session_id -> metadata)
+        self.upload_sessions: Dict[str, Any] = {}
 
         Logger.event("INIT", "文件管理器(方案 B)初始化", cache_dir=str(self.file_cache_dir))
 
