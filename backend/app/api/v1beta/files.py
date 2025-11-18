@@ -67,7 +67,7 @@ async def create_file(
     )
 
 
-@router.put(
+@router.post(
     "/files/upload/{session_id}",
     response_model=UploadFileResponse,
     name="files.resumable_upload",
@@ -83,22 +83,16 @@ async def resumable_upload(
         raise HTTPException(status_code=404, detail="Upload session not found.")
     
     metadata = file_manager.upload_sessions.pop(session_id)
-    
-    # 将原始请求体包装成 UploadFile 接口
-    upload_file = UploadFile(
-        filename=metadata.get("display_name", "untitled"),
-        file=request.stream(),
-    )
+    filename = metadata.get("display_name", "untitled")
 
     # --- 从这里开始，是我们之前实现的方案 B 核心逻辑 ---
     request_id = str(uuid.uuid4())
-    Logger.api_request(request_id, f"文件内容上传 | {upload_file.filename}")
+    Logger.api_request(request_id, f"文件内容上传 | {filename}")
 
     try:
-        # FastAPI 的 UploadFile 需要 size，但 request.stream() 没有，这里我们先忽略
-        # 在 save_file_to_cache 中也不要依赖 file.size
-        setattr(upload_file, "size", -1)
-        sha256, file_path = await file_manager.save_file_to_cache(upload_file)
+        sha256, file_path, size_bytes = await file_manager.save_stream_to_cache(
+            request.stream(), filename
+        )
     except Exception as e:
         Logger.error("保存文件到缓存失败", exc=e)
         raise HTTPException(status_code=500, detail="Failed to save file to cache.")
@@ -111,7 +105,13 @@ async def resumable_upload(
                 return UploadFileResponse(file=File.model_validate(data))
 
     if not entry:
-        entry = file_manager.create_metadata_entry(sha256, file_path, upload_file)
+        entry = file_manager.create_metadata_entry(
+            sha256=sha256,
+            file_path=file_path,
+            filename=filename,
+            mime_type=request.headers.get("content-type"),
+            size_bytes=size_bytes,
+        )
 
     # TODO: 这里的同步上传逻辑需要与第九步的请求处理器进行最终整合
     client_id = manager.get_next_client()
@@ -245,9 +245,8 @@ async def delete_file(request: Request, name: str):
         if data.get("status") == "synced" and "name" in data:
             remote_name = data["name"]
             # 使用 manager 创建一个独立的后台删除任务
-            # TODO: 需要一个更通用的后台任务执行器
             Logger.info(f"派发远程文件删除任务", client_id=client_id, file_name=remote_name)
-            # asyncio.create_task(manager.proxy_request(...)) # 简化示意
+            manager.trigger_delete_task(client_id, remote_name)
 
     # 立即删除本地缓存和元数据
     file_manager._delete_entry(sha256)

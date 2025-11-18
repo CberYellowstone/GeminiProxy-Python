@@ -11,7 +11,7 @@ import shutil
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, AsyncGenerator, Dict, Optional, Tuple
 
 from app.core.config import settings
 from app.core.log_utils import Logger
@@ -80,26 +80,29 @@ class FileManager:
         sub_dir2 = sha256[2:4]
         return self.file_cache_dir / sub_dir1 / sub_dir2 / f"{sha256}.bin"
 
-    async def save_file_to_cache(self, file: UploadFile) -> Tuple[str, Path]:
+    async def save_stream_to_cache(
+        self, stream: AsyncGenerator[bytes, None], filename: str
+    ) -> Tuple[str, Path, int]:
         """
-        将上传的文件流保存到缓存目录，并同步计算 sha256。
+        将任何异步字节流保存到缓存，并同步计算 sha256 和大小。
 
         Args:
-            file: FastAPI 的 UploadFile 对象，包含文件流。
+            stream: 任何异步字节生成器。
+            filename: 用于创建临时文件的原始文件名。
 
         Returns:
-            一个元组 (sha256_hex, file_path)，包含计算出的 sha256 和文件保存的路径。
+            一个元组 (sha256_hex, file_path, size_bytes)。
         """
         sha256 = hashlib.sha256()
-        # 先保存到一个临时位置，计算完 sha256 后再移动到最终位置
-        temp_path = self.file_cache_dir / f"temp_{file.filename}"
+        size_bytes = 0
+        temp_path = self.file_cache_dir / f"temp_{filename}"
 
         try:
             with open(temp_path, "wb") as f:
-                # 逐块读取，以处理大文件并计算哈希
-                while chunk := await file.read(8192):  # 8KB chunks
+                async for chunk in stream:
                     sha256.update(chunk)
                     f.write(chunk)
+                    size_bytes += len(chunk)
 
             sha256_hex = sha256.hexdigest()
             final_path = self._get_cache_path(sha256_hex)
@@ -115,14 +118,12 @@ class FileManager:
                 "文件已保存到缓存",
                 sha256=sha256_hex,
                 path=str(final_path),
+                size=size_bytes,
             )
-            return sha256_hex, final_path
+            return sha256_hex, final_path, size_bytes
         finally:
-            # 确保临时文件在任何情况下都被删除
             if os.path.exists(temp_path):
                 os.remove(temp_path)
-            # 确保文件指针回到开头，以便后续可能的操作
-            await file.seek(0)
 
     # ========================================================================
     # 元数据管理
@@ -139,14 +140,16 @@ class FileManager:
         """通过 gemini file name 获取 sha256"""
         return self.reverse_mapping.get(file_name)
 
-    def create_metadata_entry(self, sha256: str, file_path: Path, file: UploadFile) -> FileCacheEntry:
+    def create_metadata_entry(
+        self, *, sha256: str, file_path: Path, filename: str, mime_type: Optional[str], size_bytes: int
+    ) -> FileCacheEntry:
         """创建一个新的元数据条目"""
         entry = FileCacheEntry(
             sha256=sha256,
             local_path=file_path,
-            original_filename=file.filename,
-            mime_type=file.content_type,
-            size_bytes=file.size,
+            original_filename=filename,
+            mime_type=mime_type,
+            size_bytes=size_bytes,
         )
         self.metadata_store[sha256] = entry
         Logger.event("METADATA_CREATE", "创建文件元数据", sha256=sha256)

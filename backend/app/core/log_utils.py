@@ -177,20 +177,25 @@ class Logger:
             logging.error(log_msg)
 
     @staticmethod
-    def info(message: str):
-        """普通信息日志"""
-        logging.info(message)
+    def _format_context(context: dict) -> str:
+        """格式化上下文信息"""
+        if not context:
+            return ""
+        ctx = " | ".join(f"{k}: [cyan]{v}[/cyan]" for k, v in context.items())
+        return f" | {ctx}"
 
     @staticmethod
-    def debug(message: str):
+    def info(message: str, **context):
+        """普通信息日志"""
+        logging.info(f"{message}{Logger._format_context(context)}")
+
+    @staticmethod
+    def debug(message: str, **context):
         """调试日志"""
-        logging.debug(message)
+        logging.debug(f"{message}{Logger._format_context(context)}")
 
     @staticmethod
     def warning(message: str, **context):
         """警告日志"""
-        ctx = " | ".join(f"{k}: [yellow]{v}[/yellow]" for k, v in context.items())
-        log_msg = f"[bold orange]警告[/bold orange] {message}"
-        if ctx:
-            log_msg += f" | {ctx}"
+        log_msg = f"[bold orange]警告[/bold orange] {message}{Logger._format_context(context)}"
         logging.warning(log_msg)

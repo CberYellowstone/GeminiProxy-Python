@@ -77,8 +77,15 @@ class ConnectionManager:
             future = self.pending_responses.pop(request_id)
             error_info = message.get("status", {}).get("error")
             if error_info:
-                # 将完整的错误信息传递给异常
-                exception = ApiException(status_code=error_info.get("code"), detail=error_info)
+                # 增加健壮性，处理 error_info 不是字典的情况
+                if isinstance(error_info, dict):
+                    code = error_info.get("code", 500)
+                    detail = error_info
+                else:
+                    code = 500
+                    detail = {"message": str(error_info)}
+                
+                exception = ApiException(status_code=code, detail=detail)
                 future.set_exception(exception)
             else:
                 future.set_result(payload)
@@ -185,9 +192,10 @@ class ConnectionManager:
                         Logger.warning("检测到文件过期/未找到，触发全局重置", file_name=file_name, sha256=sha256)
                         file_manager.reset_replication_map(sha256)
                         # 标记异常，以便上层进行同步重建
-                        e.sha256_to_reset = sha256
+                        e.is_resettable = True
 
-            raise e
+            # 重新抛出更详细的HTTP异常
+            raise HTTPException(status_code=e.status_code, detail=e.detail)
         except Exception as e:
             self._cleanup_request(request_id)
             raise HTTPException(
@@ -423,6 +431,26 @@ class ConnectionManager:
             file_manager.update_replication_status(sha256, client_id, "failed")
             Logger.error("同步文件重建失败", exc=e, sha256=sha256, client_id=client_id)
             raise  # 将异常向上抛出
+
+    def trigger_delete_task(self, client_id: str, file_name: str):
+        """触发一个后台任务来异步删除远程文件"""
+        create_background_task(self._delete_file_task(client_id, file_name))
+
+    async def _delete_file_task(self, client_id: str, file_name: str):
+        """异步删除远程文件的实际后台任务"""
+        request_id = f"delete-{file_name.replace('/', '-')}"
+        Logger.event("DELETE_START", "开始异步远程文件删除", client_id=client_id, file_name=file_name)
+        try:
+            await self.proxy_request(
+                command_type="delete_file",
+                payload={"file_name": file_name},
+                request_id=request_id,
+                client_id=client_id,
+            )
+            Logger.event("DELETE_SUCCESS", "异步远程文件删除成功", client_id=client_id, file_name=file_name)
+        except Exception as e:
+            # 忽略错误，因为最终文件会被 TTL 清理
+            Logger.warning("异步远程文件删除失败", exc=e, client_id=client_id, file_name=file_name)
 
 
 manager = ConnectionManager()
