@@ -1,49 +1,44 @@
-"""文件管理模块
+"""文件管理模块 (方案 B)
 
-负责管理文件上传会话、文件元数据缓存和临时文件清理。
+负责管理文件缓存、元数据、后台清理和 sha256 计算。
 """
 
 import asyncio
-import json
+import hashlib
 import logging
-import re
-import secrets
+import os
 import shutil
-import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict, Optional, Tuple
 
 from app.core.config import settings
 from app.core.log_utils import Logger
-from app.schemas.gemini_files import File as FileMetadata
-from app.schemas.gemini_files import InitialUploadRequest
+from fastapi import UploadFile
 
 # ============================================================================
-# 数据类
+# 数据类 (方案 B)
 # ============================================================================
 
 
 @dataclass
-class UploadSession:
-    """上传会话数据类
+class FileCacheEntry:
+    """文件缓存元数据条目"""
 
-    Attributes:
-        real_upload_url: 真实的 Gemini 上传 URL
-        metadata: 文件元数据请求对象
-        created_at: 会话创建时间
-        temp_chunks: 临时文件块路径列表
-    """
-
-    real_upload_url: str
-    metadata: InitialUploadRequest
-    created_at: datetime
-    temp_chunks: list[Path] = field(default_factory=list)
+    sha256: str
+    local_path: Path
+    original_filename: str
+    mime_type: Optional[str]
+    size_bytes: int
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    last_accessed_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    gemini_file_expiration: Optional[datetime] = None
+    replication_map: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 
 # ============================================================================
-# 文件管理器
+# 文件管理器 (方案 B)
 # ============================================================================
 
 
@@ -51,346 +46,239 @@ class FileManager:
     """文件管理器
 
     职责:
-    1. 管理上传会话的生命周期
-    2. 处理文件块的上传和下载
-    3. 管理文件元数据缓存
-    4. 定期清理过期资源
+    1.  将上传的文件内容存储到本地缓存。
+    2.  计算文件的 sha256 作为唯一标识。
+    3.  管理文件的核心元数据（包括复制状态）。
+    4.  提供后台任务进行缓存清理 (TTL + LRU)。
     """
-
-    # ========================================================================
-    # 初始化
-    # ========================================================================
 
     def __init__(self):
         """初始化文件管理器"""
-        # 文件元数据缓存（单一真相来源）
-        self.file_metadata_store: dict[str, FileMetadata] = {}
+        # 文件缓存目录
+        self.file_cache_dir = Path(settings.FILE_CACHE_DIR)
+        self.file_cache_dir.mkdir(parents=True, exist_ok=True)
 
-        # 上传会话管理
-        self.upload_sessions: dict[str, UploadSession] = {}
+        # 核心元数据存储 (sha256 -> FileCacheEntry)
+        self.metadata_store: Dict[str, FileCacheEntry] = {}
+        # 反向映射 (gemini_file_name -> sha256)
+        self.reverse_mapping: Dict[str, str] = {}
 
-        # 一次性下载令牌存储：用于前端下载临时文件块
-        self.chunk_download_tokens: dict[str, Path] = {}
+        Logger.event("INIT", "文件管理器(方案 B)初始化", cache_dir=str(self.file_cache_dir))
 
-        # 临时文件块存储目录
-        self.temp_chunks_dir = Path(settings.TEMP_CHUNKS_DIR)
-        self.temp_chunks_dir.mkdir(parents=True, exist_ok=True)
+    def _get_cache_path(self, sha256: str) -> Path:
+        """根据 sha256 生成分层的文件缓存路径"""
+        # 使用前4个字符创建两级子目录，避免单个目录下文件过多
+        # 例如: d29a...f2 -> /.../file_cache/d2/9a/d29a...f2.bin
+        if len(sha256) < 4:
+            raise ValueError("sha256 ahash must be at least 4 characters long")
+        sub_dir1 = sha256[:2]
+        sub_dir2 = sha256[2:4]
+        return self.file_cache_dir / sub_dir1 / sub_dir2 / f"{sha256}.bin"
 
-        Logger.event("INIT", "文件管理器初始化", temp_dir=str(self.temp_chunks_dir))
-
-    # ========================================================================
-    # 上传会话管理
-    # ========================================================================
-
-    def create_upload_session(self, real_upload_url: str, metadata: InitialUploadRequest) -> str:
-        """创建新的上传会话
+    async def save_file_to_cache(self, file: UploadFile) -> Tuple[str, Path]:
+        """
+        将上传的文件流保存到缓存目录，并同步计算 sha256。
 
         Args:
-            real_upload_url: 真实的 Gemini 上传 URL
-            metadata: 文件元数据请求对象
+            file: FastAPI 的 UploadFile 对象，包含文件流。
 
         Returns:
-            代理会话 ID
+            一个元组 (sha256_hex, file_path)，包含计算出的 sha256 和文件保存的路径。
         """
-        proxy_session_id = str(uuid.uuid4())
-        self.upload_sessions[proxy_session_id] = UploadSession(
-            real_upload_url=real_upload_url,
-            metadata=metadata,
-            created_at=datetime.now(),
+        sha256 = hashlib.sha256()
+        # 先保存到一个临时位置，计算完 sha256 后再移动到最终位置
+        temp_path = self.file_cache_dir / f"temp_{file.filename}"
+
+        try:
+            with open(temp_path, "wb") as f:
+                # 逐块读取，以处理大文件并计算哈希
+                while chunk := await file.read(8192):  # 8KB chunks
+                    sha256.update(chunk)
+                    f.write(chunk)
+
+            sha256_hex = sha256.hexdigest()
+            final_path = self._get_cache_path(sha256_hex)
+
+            # 创建目标子目录
+            final_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # 将临时文件移动到最终位置
+            shutil.move(temp_path, final_path)
+
+            Logger.event(
+                "FILE_CACHE_SAVE",
+                "文件已保存到缓存",
+                sha256=sha256_hex,
+                path=str(final_path),
+            )
+            return sha256_hex, final_path
+        finally:
+            # 确保临时文件在任何情况下都被删除
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            # 确保文件指针回到开头，以便后续可能的操作
+            await file.seek(0)
+
+    # ========================================================================
+    # 元数据管理
+    # ========================================================================
+
+    def get_metadata_entry(self, sha256: str) -> Optional[FileCacheEntry]:
+        """通过 sha256 获取元数据条目，并更新访问时间"""
+        entry = self.metadata_store.get(sha256)
+        if entry:
+            entry.last_accessed_at = datetime.now(timezone.utc)
+        return entry
+
+    def get_sha256_by_filename(self, file_name: str) -> Optional[str]:
+        """通过 gemini file name 获取 sha256"""
+        return self.reverse_mapping.get(file_name)
+
+    def create_metadata_entry(self, sha256: str, file_path: Path, file: UploadFile) -> FileCacheEntry:
+        """创建一个新的元数据条目"""
+        entry = FileCacheEntry(
+            sha256=sha256,
+            local_path=file_path,
+            original_filename=file.filename,
+            mime_type=file.content_type,
+            size_bytes=file.size,
+        )
+        self.metadata_store[sha256] = entry
+        Logger.event("METADATA_CREATE", "创建文件元数据", sha256=sha256)
+        return entry
+
+    def update_replication_status(
+        self, sha256: str, client_id: str, status: str, gemini_file: Optional[Dict] = None
+    ):
+        """更新文件的复制状态"""
+        entry = self.get_metadata_entry(sha256)
+        if not entry:
+            return
+
+        replication_data = {"status": status}
+        if gemini_file:
+            replication_data.update(gemini_file)
+            file_name = gemini_file.get("name")
+            if file_name:
+                # 更新反向映射
+                self.reverse_mapping[file_name] = sha256
+                # 如果这是第一次成功上传，记录过期时间
+                if not entry.gemini_file_expiration and "expirationTime" in gemini_file:
+                    entry.gemini_file_expiration = datetime.fromisoformat(gemini_file["expirationTime"])
+
+        entry.replication_map[client_id] = replication_data
+        Logger.debug(
+            "更新复制状态",
+            sha256=sha256,
+            client_id=client_id,
+            status=status,
         )
 
-        display_name = metadata.file.display_name or "Unknown"
-        Logger.event("SESSION_CREATE", "创建上传会话", session_id=proxy_session_id, file=display_name)
+    def reset_replication_map(self, sha256: str):
+        """全局重置：清空文件的复制地图"""
+        entry = self.get_metadata_entry(sha256)
+        if not entry:
+            return
 
-        return proxy_session_id
+        # 从反向映射中删除所有相关的旧 file_name
+        for client_id, data in entry.replication_map.items():
+            if "name" in data:
+                self.reverse_mapping.pop(data["name"], None)
 
-    def get_upload_session(self, proxy_session_id: str) -> UploadSession | None:
-        """通过代理会话 ID 获取上传会话
+        entry.replication_map.clear()
+        entry.gemini_file_expiration = None  # 重置过期时间
+        Logger.event("REPLICATION_RESET", "文件复制地图已重置", sha256=sha256)
 
-        Args:
-            proxy_session_id: 代理会话 ID
+    def _delete_entry(self, sha256: str):
+        """内部方法：删除一个缓存条目及其关联的所有数据"""
+        entry = self.metadata_store.pop(sha256, None)
+        if not entry:
+            return
 
-        Returns:
-            上传会话对象，不存在则返回 None
-        """
-        return self.upload_sessions.get(proxy_session_id)
+        # 从反向映射中删除
+        for client_id, data in entry.replication_map.items():
+            if "name" in data:
+                self.reverse_mapping.pop(data["name"], None)
 
-    # ========================================================================
-    # 上传数据处理
-    # ========================================================================
-
-    @staticmethod
-    def extract_upload_offset(request) -> int:
-        """从请求头中提取上传偏移量
-
-        优先级: Content-Range > X-Goog-Upload-Offset
-
-        Args:
-            request: FastAPI 请求对象
-
-        Returns:
-            上传偏移量（字节）
-
-        Raises:
-            ValueError: 无法解析偏移量时抛出
-        """
-        content_range_header = request.headers.get("Content-Range")
-        x_goog_upload_offset_header = request.headers.get("X-Goog-Upload-Offset")
-
-        # 尝试从 Content-Range 解析 (格式: "bytes 100-200/500")
-        if content_range_header:
-            match = re.search(r"bytes (\d+)-", content_range_header)
-            if match:
-                return int(match.group(1))
-
-        # 尝试从 X-Goog-Upload-Offset 解析
-        if x_goog_upload_offset_header is not None:
-            try:
-                return int(x_goog_upload_offset_header)
-            except (ValueError, TypeError):
-                raise ValueError("Invalid X-Goog-Upload-Offset header.")
-
-        # 两者都不存在
-        raise ValueError("Missing upload offset information (Content-Range or X-Goog-Upload-Offset).")
-
-    async def save_chunk_to_temp_file(self, proxy_session_id: str, request) -> Path:
-        """保存数据块到临时文件
-
-        Args:
-            proxy_session_id: 代理会话 ID
-            request: FastAPI 请求对象（包含流式数据）
-
-        Returns:
-            临时文件路径
-
-        Raises:
-            ValueError: 会话不存在
-            IOError: 文件写入失败
-        """
-        session = self.get_upload_session(proxy_session_id)
-        if not session:
-            raise ValueError(f"Upload session {proxy_session_id} not found")
-
-        # 生成临时文件
-        chunk_id = str(uuid.uuid4())
-        chunk_path = self.temp_chunks_dir / f"chunk_{chunk_id}.bin"
-        session.temp_chunks.append(chunk_path)
-
-        # 保存数据流
+        # 删除物理文件
         try:
-            with open(chunk_path, "wb") as f:
-                async for chunk in request.stream():
-                    f.write(chunk)
-            return chunk_path
-        except Exception as e:
-            Logger.error("保存文件块失败", exc=e, chunk_path=str(chunk_path), session_id=proxy_session_id)
-            # 清理失败的文件
-            if chunk_path.exists():
-                chunk_path.unlink()
-            raise IOError(f"Failed to save file chunk: {str(e)}")
-
-    def process_upload_response(self, proxy_session_id: str, response_payload: dict[str, Any]) -> dict[str, Any]:
-        """处理上传响应并更新元数据
-
-        Args:
-            proxy_session_id: 代理会话 ID
-            response_payload: 前端返回的响应数据
-
-        Returns:
-            处理后的响应数据（包含 status, headers, content, is_final）
-            content 已序列化为字符串，可直接用于 HTTP 响应
-        """
-        response_status = response_payload.get("status", 200)
-        response_headers = response_payload.get("headers", {})
-        response_body = response_payload.get("body", {})
-
-        # 检查是否为最终块（包含文件元数据）
-        is_final_chunk = isinstance(response_body, dict) and "file" in response_body
-
-        if is_final_chunk:
-            # 保存文件元数据
-            file_metadata = FileMetadata.model_validate(response_body["file"])
-            self.save_file_metadata(file_metadata)
-
-            # 清理会话
-            self.cleanup_session(proxy_session_id)
-
-            Logger.event("UPLOAD_COMPLETE", "文件上传完成", file=file_metadata.name, session_id=proxy_session_id)
-
-        # 序列化响应内容
-        content = json.dumps(response_body) if isinstance(response_body, dict) else str(response_body)
-
-        return {"status": response_status, "headers": response_headers, "content": content, "is_final": is_final_chunk}
-
-    # ========================================================================
-    # 临时文件块令牌管理
-    # ========================================================================
-
-    def generate_chunk_download_token(self, chunk_path: Path) -> str:
-        """生成一次性下载令牌
-
-        Args:
-            chunk_path: 临时文件块路径
-
-        Returns:
-            安全的 URL-safe 令牌字符串
-        """
-        token = secrets.token_urlsafe(32)
-        self.chunk_download_tokens[token] = chunk_path
-        return token
-
-    def consume_chunk_download_token(self, token: str) -> Path | None:
-        """消耗一次性下载令牌（使用后失效）
-
-        Args:
-            token: 下载令牌
-
-        Returns:
-            文件块路径，如果令牌无效返回 None
-        """
-        return self.chunk_download_tokens.pop(token, None)
-
-    def invalidate_chunk_download_token(self, token: str):
-        """失效一个下载令牌
-
-        Args:
-            token: 要失效的令牌
-        """
-        self.chunk_download_tokens.pop(token, None)
-
-    # ========================================================================
-    # 文件元数据管理
-    # ========================================================================
-
-    def save_file_metadata(self, file: FileMetadata):
-        """保存文件元数据到缓存
-
-        Args:
-            file: 文件元数据对象
-        """
-        self.file_metadata_store[file.name] = file
-        Logger.event("METADATA_SAVE", "保存文件元数据", file=file.name)
-
-    def get_file_metadata(self, file_name: str) -> FileMetadata | None:
-        """从缓存获取文件元数据
-
-        Args:
-            file_name: 文件名称（如 files/abc123 或 abc123）
-
-        Returns:
-            文件元数据对象，不存在则返回 None
-        """
-        # 确保文件名包含 files/ 前缀
-        if not file_name.startswith("files/"):
-            file_name = f"files/{file_name}"
-        return self.file_metadata_store.get(file_name)
-
-    def list_files(self, page_size: int, page_token: str | None) -> dict:
-        """列出所有文件（带分页）
-
-        Args:
-            page_size: 每页文件数量
-            page_token: 分页令牌（起始索引）
-
-        Returns:
-            包含文件列表和下一页令牌的字典
-        """
-        # 按创建时间倒序排序
-        all_files = sorted(self.file_metadata_store.values(), key=lambda f: f.create_time, reverse=True)
-
-        # 解析分页令牌
-        start_index = 0
-        if page_token:
-            try:
-                start_index = int(page_token)
-            except ValueError:
-                pass  # 无效令牌，从头开始
-
-        # 分页切片
-        end_index = start_index + page_size
-        paginated_files = all_files[start_index:end_index]
-
-        # 生成下一页令牌
-        next_page_token = str(end_index) if end_index < len(all_files) else None
-
-        return {
-            "files": paginated_files,
-            "nextPageToken": next_page_token,
-        }
-
-    def delete_file_metadata(self, file_name: str) -> bool:
-        """从缓存删除文件元数据
-
-        Args:
-            file_name: 文件名称（如 files/abc123 或 abc123）
-
-        Returns:
-            是否成功删除
-        """
-        # 确保文件名包含 files/ 前缀
-        if not file_name.startswith("files/"):
-            file_name = f"files/{file_name}"
-
-        if file_name in self.file_metadata_store:
-            del self.file_metadata_store[file_name]
-            Logger.event("METADATA_DELETE", "删除文件元数据", file=file_name)
-            return True
-        return False
-
-    # ========================================================================
-    # 清理与维护
-    # ========================================================================
-
-    def cleanup_session(self, proxy_session_id: str):
-        """清理上传会话及其关联的临时文件
-
-        Args:
-            proxy_session_id: 代理会话 ID
-        """
-        session = self.upload_sessions.pop(proxy_session_id, None)
-        if session:
-            # 删除所有临时文件块
-            for chunk_path in session.temp_chunks:
+            if entry.local_path.exists():
+                os.remove(entry.local_path)
+                # 尝试删除空的父目录
                 try:
-                    if chunk_path.exists():
-                        chunk_path.unlink()
-                except OSError as e:
-                    Logger.error("删除临时文件块失败", exc=e, chunk_path=str(chunk_path), session_id=proxy_session_id)
+                    entry.local_path.parent.rmdir()
+                    entry.local_path.parent.parent.rmdir()
+                except OSError:
+                    # 目录非空，忽略错误
+                    pass
+        except OSError as e:
+            Logger.error("删除缓存文件失败", exc=e, path=str(entry.local_path))
 
-            Logger.event("SESSION_CLEANUP", "清理上传会话", session_id=proxy_session_id, chunks_deleted=len(session.temp_chunks))
+        Logger.event("FILE_CACHE_DELETE", "文件已从缓存中删除", sha256=sha256)
 
     async def periodic_cleanup_task(self):
-        """定期清理过期的上传会话
-
-        在后台运行的异步任务，定期检查并清理超时会话。
-        """
+        """后台定期清理任务，结合 TTL 和 LRU 策略。"""
         while True:
-            await asyncio.sleep(settings.SESSION_CLEANUP_INTERVAL)
+            await asyncio.sleep(settings.FILE_CACHE_CLEANUP_INTERVAL)
+            Logger.info("开始执行文件缓存清理任务...")
 
-            now = datetime.now()
-            expiration_threshold = timedelta(seconds=settings.SESSION_EXPIRATION_TIME)
+            now = datetime.now(timezone.utc)
+            to_delete = set()
 
-            # 查找过期会话
-            expired_sessions = [
-                session_id for session_id, session in self.upload_sessions.items() if now - session.created_at > expiration_threshold
-            ]
+            # 1. TTL 清理：标记所有已过期的文件
+            for sha256, entry in self.metadata_store.items():
+                if entry.gemini_file_expiration and now > entry.gemini_file_expiration:
+                    to_delete.add(sha256)
 
-            if expired_sessions:
-                Logger.event("PERIODIC_CLEANUP", "发现过期会话", count=len(expired_sessions))
-                for session_id in expired_sessions:
-                    self.cleanup_session(session_id)
+            if to_delete:
+                Logger.info(f"TTL清理: 发现 {len(to_delete)} 个过期文件。")
 
-    def cleanup_all_temp_files(self):
-        """删除整个临时目录
+            # 2. LRU 清理：如果超出配额，继续标记最久未使用的文件
+            try:
+                total_size_bytes = sum(
+                    entry.size_bytes for sha256, entry in self.metadata_store.items() if sha256 not in to_delete
+                )
+                quota_bytes = settings.FILE_CACHE_QUOTA_MB * 1024 * 1024
 
-        在应用关闭时调用，清理所有临时文件。
+                if total_size_bytes > quota_bytes:
+                    Logger.info(
+                        f"LRU清理: 缓存超出配额 ({(total_size_bytes / 1024 / 1024):.2f}MB > {settings.FILE_CACHE_QUOTA_MB}MB)。"
+                    )
+                    # 按最后访问时间升序排序 (最旧的在前)
+                    sorted_entries = sorted(
+                        [entry for sha256, entry in self.metadata_store.items() if sha256 not in to_delete],
+                        key=lambda x: x.last_accessed_at,
+                    )
+
+                    for entry in sorted_entries:
+                        if total_size_bytes <= quota_bytes:
+                            break
+                        to_delete.add(entry.sha256)
+                        total_size_bytes -= entry.size_bytes
+            except Exception as e:
+                Logger.error("计算缓存大小时发生错误", exc=e)
+
+
+            # 3. 执行删除
+            if to_delete:
+                Logger.info(f"准备删除 {len(to_delete)} 个缓存条目...")
+                for sha256 in list(to_delete):
+                    self._delete_entry(sha256)
+                Logger.info("缓存清理任务完成。")
+            else:
+                Logger.info("缓存状态正常，无需清理。")
+
+    def cleanup_all_cache_files(self):
+        """
+        删除整个文件缓存目录。
+        在应用关闭时调用，用于清理。
         """
         try:
-            if self.temp_chunks_dir.exists():
-                shutil.rmtree(self.temp_chunks_dir)
-                Logger.event("SHUTDOWN_CLEANUP", "删除临时目录", temp_dir=str(self.temp_chunks_dir))
+            if self.file_cache_dir.exists():
+                shutil.rmtree(self.file_cache_dir)
+                Logger.event("SHUTDOWN_CLEANUP", "删除文件缓存目录", cache_dir=str(self.file_cache_dir))
         except OSError as e:
-            Logger.error("删除临时目录失败", exc=e, temp_dir=str(self.temp_chunks_dir))
+            Logger.error("删除文件缓存目录失败", exc=e, cache_dir=str(self.file_cache_dir))
 
 
 # ============================================================================

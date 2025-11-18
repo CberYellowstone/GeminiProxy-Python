@@ -1,11 +1,14 @@
 import asyncio
 import logging
+import uuid
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Optional
 
+from app.core.background_tasks import create_background_task
 from app.core.config import settings
 from app.core.exceptions import ApiException
+from app.core.file_manager import file_manager
 from app.core.log_utils import Logger
 from fastapi import HTTPException, Request, WebSocket, status
 from pydantic import BaseModel
@@ -16,14 +19,6 @@ class ConnectionManager:
         self.active_connections: dict[str, WebSocket] = {}
         self.pending_responses: dict[str, asyncio.Future] = {}
         self.streaming_responses: dict[str, asyncio.Queue] = {}
-
-        # 新增：追踪 request_id 到 client_id 的映射
-        self.request_to_client: dict[str, str] = {}
-
-        # 新增：追踪每个 client 正在处理的请求集合
-        self.client_active_requests: dict[str, set[str]] = {}
-
-        # 新增：追踪流式请求的包计数（用于日志优化）
         self.streaming_chunk_count: dict[str, int] = {}
 
         self._client_ids: list[str] = []
@@ -33,32 +28,22 @@ class ConnectionManager:
         await websocket.accept()
         self.active_connections[client_id] = websocket
         self._client_ids.append(client_id)
-        self.client_active_requests[client_id] = set()
 
     async def disconnect(self, client_id: str):
-        """断开客户端连接，清理所有活跃请求"""
-        # 清理该客户端的所有活跃请求
-        if client_id in self.client_active_requests:
-            request_ids = list(self.client_active_requests[client_id])
-            Logger.event("DISCONNECT", f"取消 {len(request_ids)} 个请求", client_id=client_id)
-
-            # 使用 cancel_request 统一清理
-            for request_id in request_ids:
-                await self.cancel_request(request_id)
-
-            # 确保客户端条目被删除
-            self.client_active_requests.pop(client_id, None)
-
-        # 清理连接
+        """断开客户端连接"""
+        # TODO: 在方案B中，我们可能需要在这里触发对该客户端相关文件的状态更新
         if client_id in self.active_connections:
             del self.active_connections[client_id]
         if client_id in self._client_ids:
             self._client_ids.remove(client_id)
+        Logger.event("DISCONNECT", "客户端断开连接", client_id=client_id)
+
 
     async def handle_message(self, message: dict[str, Any]):
         """处理从前端收到的响应消息"""
         payload = message.get("payload", {})
         request_id = message.get("id")
+        client_id = message.get("client_id", "unknown") # 假设响应中会包含client_id
 
         if request_id:
             is_finished = payload.get("is_finished", "N/A")
@@ -68,7 +53,6 @@ class ConnectionManager:
         if request_id in self.streaming_responses:
             queue = self.streaming_responses[request_id]
             if payload.get("is_streaming"):
-                # 追踪包计数
                 if request_id not in self.streaming_chunk_count:
                     self.streaming_chunk_count[request_id] = 0
                 self.streaming_chunk_count[request_id] += 1
@@ -77,31 +61,24 @@ class ConnectionManager:
                 if "chunk" in payload:
                     queue.put_nowait(payload["chunk"])
 
-                client_id = self.request_to_client.get(request_id, "unknown")
-
                 if payload.get("is_finished"):
                     queue.put_nowait(None)
-                    # 记录最后一个包
                     Logger.ws_receive(request_id, client_id, is_stream_end=True, total_chunks=chunk_num, data=message)
-                    self._cleanup_request(request_id)  # 正常完成时清理
+                    self._cleanup_request(request_id)
                 elif chunk_num == 1:
-                    # 记录第一个包
                     Logger.ws_receive(request_id, client_id, is_stream_start=True, data=message)
                 else:
-                    # 中间包: INFO 级别不显示, DEBUG 级别显示
                     Logger.ws_receive(request_id, client_id, is_stream_middle=True, data=message)
             return
 
         # 处理非流式响应
         if request_id and request_id in self.pending_responses:
-            # 记录非流式响应
-            client_id = self.request_to_client.get(request_id, "unknown")
             Logger.ws_receive(request_id, client_id, data=message)
             future = self.pending_responses.pop(request_id)
-            if message.get("status", {}).get("error"):
-                code = message["status"].get("code")
-                error_payload = message["status"].get("errorPayload")
-                exception = ApiException(status_code=code, detail=error_payload)
+            error_info = message.get("status", {}).get("error")
+            if error_info:
+                # 将完整的错误信息传递给异常
+                exception = ApiException(status_code=error_info.get("code"), detail=error_info)
                 future.set_exception(exception)
             else:
                 future.set_result(payload)
@@ -122,43 +99,35 @@ class ConnectionManager:
         return list(self.active_connections.keys())
 
     @asynccontextmanager
-    async def monitored_proxy_request(self, request_id: str, request: Request):
+    async def monitored_proxy_request(self, request_id: str, request: Request, client_id: str):
         """
-        An async context manager to monitor and clean up a proxy request.
-        It handles request registration and cancellation/cleanup upon exit.
+        一个简化的上下文管理器，用于监控API请求的生命周期并确保清理。
         """
-        client_id = self.get_next_client()
-        self.request_to_client[request_id] = client_id
-        self.client_active_requests[client_id].add(request_id)
-        Logger.debug(f"注册请求 {request_id} → {client_id}")
-
         try:
             yield
         finally:
+            # 核心清理逻辑现在由请求处理函数负责
+            # 这个管理器主要确保在请求意外断开时，能有一个记录
             if await request.is_disconnected():
-                Logger.event("DISCONNECT", "客户端断开连接", request_id=request_id)
-                await self.cancel_request(request_id)
-            else:
-                # For non-streaming requests, the future is cleaned up when the response is received.
-                # For streaming, it's cleaned up when the stream ends.
-                # This is a fallback for unexpected exits.
-                if request_id in self.pending_responses or request_id in self.streaming_responses:
-                    self._cleanup_request(request_id)
+                Logger.event("DISCONNECT", "API客户端在请求处理中断开连接", request_id=request_id)
+
 
     async def proxy_request(
         self,
+        *,
         command_type: str,
         payload: Any,
-        request: Request,
         request_id: str,
+        client_id: str,
         is_streaming: bool = False,
+        request: Optional[Request] = None,
     ) -> Any:
         """
-        Core proxy method: selects a client, sends a command, and awaits a response.
-        For streaming requests, it returns an async generator.
-        The actual registration and cleanup are handled by the `monitored_proxy_request` context manager.
+        核心代理方法：向指定的客户端发送命令，并等待响应。
         """
-        client_id = self.request_to_client[request_id]
+        if client_id not in self.active_connections:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Client {client_id} not connected.")
+        
         websocket = self.active_connections[client_id]
 
         if isinstance(payload, BaseModel):
@@ -175,6 +144,8 @@ class ConnectionManager:
         Logger.ws_send(request_id, client_id, command_type, command=command)
 
         if is_streaming:
+            if not request:
+                raise ValueError("Streaming requests require a 'request' object.")
             return await self._handle_streaming_request(websocket, command, request_id, request)
 
         return await self._handle_non_streaming_request(websocket, command, request_id)
@@ -200,6 +171,22 @@ class ConnectionManager:
             )
         except ApiException as e:
             self._cleanup_request(request_id)
+            # 在这里实现全局重置逻辑
+            error_detail = e.detail or {}
+            error_message = error_detail.get("message", "").lower()
+            
+            # 检查是否是文件未找到的特定错误
+            if "not found" in error_message or "file not found" in error_message:
+                # 尝试从命令的 payload 中找到 file_name
+                file_name = command.get("payload", {}).get("fileName")
+                if file_name:
+                    sha256 = file_manager.get_sha256_by_filename(file_name)
+                    if sha256:
+                        Logger.warning("检测到文件过期/未找到，触发全局重置", file_name=file_name, sha256=sha256)
+                        file_manager.reset_replication_map(sha256)
+                        # 标记异常，以便上层进行同步重建
+                        e.is_resettable = True
+
             raise e
         except Exception as e:
             self._cleanup_request(request_id)
@@ -244,93 +231,132 @@ class ConnectionManager:
 
         return stream_generator()
 
-    async def cancel_request(self, request_id: str) -> bool:
-        """
-        取消指定的请求（唯一入口点）
-        
-        职责：
-        1. 检查请求是否存在
-        2. 发送取消信号给前端
-        3. 清理后端资源
-        
-        Args:
-            request_id: 要取消的请求ID
-            
-        Returns:
-            bool: 取消操作是否成功启动
-        """
-        Logger.debug(f"尝试取消请求 {request_id}")
-
-        # 步骤 1：幂等性检查
-        if request_id not in self.request_to_client:
-            Logger.debug(f"请求 {request_id} 未找到或已取消")
-            return False
-
-        # 步骤 2：获取处理该请求的客户端
-        client_id = self.request_to_client[request_id]
-
-        # 步骤 3：发送取消信号（best effort）
-        cancel_signal_sent = False
-        if client_id in self.active_connections:
-            websocket = self.active_connections[client_id]
-            cancel_message = {
-                "type": "cancel_task",
-                "id": request_id
-            }
-            try:
-                await websocket.send_json(cancel_message)
-                Logger.event("CANCEL", "发送取消信号", request_id=request_id, client_id=client_id)
-                cancel_signal_sent = True
-            except Exception as e:
-                Logger.error("发送取消信号失败", exc=e, request_id=request_id, client_id=client_id)
-                # 即使发送失败，也要继续清理后端资源
-        else:
-            Logger.warning("客户端未连接，无法发送取消信号", client_id=client_id)
-
-        # 步骤 4：清理后端资源（必须执行）
-        self._cleanup_request(request_id)
-
-        return True
-
     def _cleanup_request(self, request_id: str):
+        """清理与请求相关的所有内部资源"""
+        self.pending_responses.pop(request_id, None)
+        self.streaming_responses.pop(request_id, None)
+        self.streaming_chunk_count.pop(request_id, None)
+        Logger.debug(f"清理请求资源 {request_id}")
+
+    # ========================================================================
+    # 方案 B: 核心请求处理流程
+    # ========================================================================
+
+    async def handle_api_request(self, *, command_type: str, payload: Any, is_streaming: bool, request: Request):
         """
-        清理与请求相关的所有内部资源（内部方法）
+        处理 API 请求的统一入口 (方案 B)。
+        集成了文件查找、客户端选择、回退、复制和容错逻辑。
+        """
+        request_id = str(uuid.uuid4())
         
-        注意：此方法是幂等的，可以安全地多次调用
-        """
-        cleaned_items = []
+        # 1. 解析文件引用 (这是一个简化的例子，实际需要更复杂的解析)
+        file_name = payload.get("payload", {}).get("contents", [{}])[0].get("fileData", {}).get("fileName")
 
-        # 清理 1：流式响应队列
-        if request_id in self.streaming_responses:
-            queue = self.streaming_responses.pop(request_id)
-            # 确保队列中的等待者被释放
-            try:
-                queue.put_nowait(None)
-            except asyncio.QueueFull:
-                pass
-            cleaned_items.append("queue")
+        client_id = self.get_next_client() # 默认轮询
+        effective_payload = payload
 
-        # 清理 2：请求映射关系
-        if request_id in self.request_to_client:
-            client_id = self.request_to_client.pop(request_id)
-            if client_id in self.client_active_requests:
-                self.client_active_requests[client_id].discard(request_id)
-            cleaned_items.append("mapping")
+        if file_name:
+            sha256 = file_manager.get_sha256_by_filename(file_name)
+            if sha256:
+                entry = file_manager.get_metadata_entry(sha256)
+                if entry:
+                    # a. 检查轮询选中的客户端是否就绪
+                    if client_id in entry.replication_map and entry.replication_map[client_id].get("status") == "synced":
+                        # 完美命中，直接使用
+                        pass
+                    else:
+                        # b. 未命中，执行即时回退
+                        found_synced = False
+                        for cid, data in entry.replication_map.items():
+                            if data.get("status") == "synced" and cid in self.active_connections:
+                                Logger.debug(f"即时回退: {client_id} -> {cid}", request_id=request_id)
+                                # 触发后台异步复制
+                                self.trigger_async_replication(sha256, client_id)
+                                client_id = cid # 切换到已同步的客户端
+                                found_synced = True
+                                break
+                        
+                        if not found_synced:
+                            # c. 没有找到任何已同步的客户端，可能都离线了，进入同步重建
+                            Logger.warning("找不到任何已同步的客户端，执行同步重建", sha256=sha256, request_id=request_id)
+                            # 这个流程比较复杂，暂时抛出异常让上层处理
+                            raise ApiException(status_code=503, detail="No available client has the required file. Please try again.")
 
-        # 清理 3：非流式响应的 Future
-        if request_id in self.pending_responses:
-            future = self.pending_responses.pop(request_id)
-            if not future.done():
-                future.cancel()
-            cleaned_items.append("future")
+                    # d. 改写 payload
+                    final_file_name = entry.replication_map[client_id].get("name")
+                    # (这是一个简化的改写，实际需要深入payload结构)
+                    effective_payload["payload"]["contents"][0]["fileData"]["fileName"] = final_file_name
 
-        # 清理 4：流式包计数
-        if request_id in self.streaming_chunk_count:
-            self.streaming_chunk_count.pop(request_id)
-            cleaned_items.append("chunk_count")
 
-        if cleaned_items:
-            Logger.debug(f"清理资源 {request_id} | {', '.join(cleaned_items)}")
+        # 实际执行请求
+        try:
+            async with self.monitored_proxy_request(request_id, request, client_id):
+                return await self.proxy_request(
+                    command_type=command_type,
+                    payload=effective_payload,
+                    request_id=request_id,
+                    client_id=client_id,
+                    is_streaming=is_streaming,
+                    request=request,
+                )
+        except ApiException as e:
+            if getattr(e, "is_resettable", False):
+                # 捕获到文件过期错误，触发同步重建
+                Logger.error("捕获到可重置的文件错误，将尝试同步重建", request_id=request_id)
+                # TODO: 在这里实现完整的同步重建逻辑
+                # 1. 轮询选择一个新客户端
+                # 2. 指挥它重新上传
+                # 3. 用新的 file_name 再次尝试 handle_api_request
+                raise HTTPException(status_code=500, detail="File expired, reconstruction not yet implemented.")
+            raise
+
+
+    def trigger_async_replication(self, sha256: str, client_id: str):
+        """触发一个后台任务来异步复制文件"""
+        create_background_task(self._replicate_file_task(sha256, client_id))
+
+    async def _replicate_file_task(self, sha256: str, client_id: str):
+        """异步复制文件的实际后台任务"""
+        request_id = f"replication-{sha256[:8]}-{client_id}"
+        Logger.event("REPLICATION_START", "开始异步文件复制", sha256=sha256, client_id=client_id)
+
+        entry = file_manager.get_metadata_entry(sha256)
+        if not entry:
+            Logger.warning("异步复制失败：找不到文件元数据", sha256=sha256)
+            return
+
+        # 简单的令牌机制，未来可以增强
+        token = "placeholder_token"
+        download_url = f"{settings.PROXY_BASE_URL}/files/internal/{sha256}/{token}:download"
+
+        try:
+            # 指挥客户端上传
+            response_payload = await self.proxy_request(
+                command_type="upload_from_url",
+                payload={
+                    "download_url": download_url,
+                    "file_metadata": {
+                        "name": entry.original_filename,
+                        "displayName": entry.original_filename,
+                        "mimeType": entry.mime_type,
+                    },
+                },
+                request_id=request_id,
+                client_id=client_id,
+            )
+            gemini_file = response_payload.get("file")
+            if not gemini_file:
+                raise ApiException(status_code=500, detail="Frontend did not return a file object.")
+
+            # 更新元数据
+            file_manager.update_replication_status(
+                sha256, client_id, "synced", gemini_file
+            )
+            Logger.event("REPLICATION_SUCCESS", "异步文件复制成功", sha256=sha256, client_id=client_id)
+
+        except Exception as e:
+            file_manager.update_replication_status(sha256, client_id, "failed")
+            Logger.error("异步文件复制失败", exc=e, sha256=sha256, client_id=client_id)
 
 
 manager = ConnectionManager()

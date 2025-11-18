@@ -1,5 +1,9 @@
-import json
-import logging
+"""文件 API 路由 (方案 B)
+
+负责处理文件的上传、下载、查询和删除。
+采用后端缓存策略。
+"""
+
 import uuid
 
 from app.core import manager
@@ -7,19 +11,15 @@ from app.core.config import settings
 from app.core.exceptions import ApiException
 from app.core.file_manager import file_manager
 from app.core.log_utils import Logger
-from app.schemas.gemini_files import File, InitialUploadRequest, ListFilesPayload, ListFilesResponse
+from app.schemas.gemini_files import File, ListFilesPayload, ListFilesResponse
 from fastapi import (
     APIRouter,
-    Body,
     Depends,
-    Header,
+    File as FastAPIFile,
     HTTPException,
-)
-from fastapi import Path as FastAPIPath
-from fastapi import (
-    Query,
     Request,
     Response,
+    UploadFile,
     status,
 )
 from fastapi.responses import FileResponse
@@ -29,167 +29,118 @@ from fastapi.responses import FileResponse
 # ============================================================================
 
 router = APIRouter(tags=["Files"])
-files_upload_router = APIRouter(tags=["Files"])
+
 
 # ============================================================================
-# 可续传上传端点
+# 文件上传 (新方案)
 # ============================================================================
 
 
-@files_upload_router.post(
-    "/upload/v1beta/files",
-    name="files.create",
-)
-async def create_file(
-    request: Request,
-    upload_protocol: str = Header(..., alias="X-Goog-Upload-Protocol"),
-    upload_command: str = Header(..., alias="X-Goog-Upload-Command"),
-    body: InitialUploadRequest = Body(...),
-):
-    """
-    Initializes a resumable upload session for a file. Returns a proxy upload URL for subsequent chunk uploads.
-    """
-    request_id = str(uuid.uuid4())
-    Logger.api_request(request_id, f"文件上传初始化 | {body.file.display_name  or "Unknown"}")
-
-    # 验证上传协议头
-    if upload_protocol != "resumable" or upload_command != "start":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid resumable upload initiation headers.",
-        )
-
-    async with manager.monitored_proxy_request(request_id, request):
-        # 向前端发送初始化指令
-        response_payload = await manager.proxy_request(
-            command_type="initiate_resumable_upload",
-            payload={"metadata": body.model_dump(by_alias=True)},
-            request=request,
-            request_id=request_id,
-        )
-
-        # 提取上传 URL
-        upload_url = response_payload.get("upload_url")
-        if not upload_url:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Frontend did not return a upload URL.",
-            )
-
-        # 创建代理会话(业务逻辑)
-        proxy_session_id = file_manager.create_upload_session(upload_url, body)
-
-        # 生成代理上传 URL
-        proxy_upload_url = f"{settings.PROXY_BASE_URL}/upload/v1beta/files/{proxy_session_id}:upload"
-
-        # 返回响应
-        response = Response(
-            headers={
-                "X-Goog-Upload-URL": proxy_upload_url,
-                "X-Goog-Upload-Status": "active",
-            },
-        )
-
-        Logger.api_response(request_id, f"会话ID: {proxy_session_id} | 返回上传URL")
-        return response
-
-
-@files_upload_router.post(
-    "/upload/v1beta/files/{session_id}:upload",
+@router.post(
+    "/files:upload",
+    response_model=File,
     name="files.upload",
 )
-async def update_file(
+async def upload_file(
     request: Request,
-    session_id: str = FastAPIPath(..., description="代理上传会话 ID"),
-    upload_command: str = Header(..., alias="X-Goog-Upload-Command"),
-    content_length: int = Header(..., alias="Content-Length"),
+    file: UploadFile = FastAPIFile(...),
 ):
     """
-    Uploads data chunks for a resumable upload session.
+    上传文件到后端缓存，并触发到 Gemini 的同步上传。
+    如果文件已存在，则直接返回现有文件信息。
     """
     request_id = str(uuid.uuid4())
-    Logger.api_request(request_id, f"文件块上传 | 会话: {session_id[:8]} | {content_length} bytes")
+    Logger.api_request(request_id, f"文件上传请求 | {file.filename}")
 
-    # 验证会话
-    session = file_manager.get_upload_session(session_id)
-    if not session:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Upload session not found.")
-
-    # 解析上传偏移量
+    # 1. 保存文件到本地缓存并计算 sha256
     try:
-        upload_offset = file_manager.extract_upload_offset(request)
-    except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-
-    # 保存数据块
-    try:
-        chunk_path = await file_manager.save_chunk_to_temp_file(session_id, request)
-    except (ValueError, IOError) as e:
+        sha256, file_path = await file_manager.save_file_to_cache(file)
+    except Exception as e:
+        Logger.error("保存文件到缓存失败", exc=e)
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR if isinstance(e, IOError) else status.HTTP_404_NOT_FOUND,
-            detail=str(e),
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to save file to cache.",
         )
 
-    # 生成一次性下载令牌
-    token = file_manager.generate_chunk_download_token(chunk_path)
-    chunk_download_url = f"{settings.PROXY_BASE_URL}/upload/v1beta/files/internal/{token}:download"
+    # 2. 检查文件是否已存在
+    entry = file_manager.get_metadata_entry(sha256)
+    if entry:
+        # 文件已存在，找到一个已同步的客户端并返回其文件信息
+        for client_id, data in entry.replication_map.items():
+            if data.get("status") == "synced":
+                Logger.api_response(request_id, f"文件已存在 (sha256: {sha256[:8]})")
+                return File.model_validate(data)
+        # 如果存在但没有一个同步成功，则进入下面的首次上传逻辑
 
-    try:
-        # 向前端代理请求
-        async with manager.monitored_proxy_request(request_id, request):
+    # 3. 首次上传或无同步副本
+    if not entry:
+        entry = file_manager.create_metadata_entry(sha256, file_path, file)
+
+    # 4. 选择一个客户端进行同步上传
+    # (这里的具体逻辑将在步骤7-9中实现，暂时用一个 placeholder)
+    # TODO: 替换为新的请求处理函数
+    async with manager.monitored_proxy_request(request_id, request) as client_id:
+        # a. 为 WebSocket 客户端生成一次性下载令牌
+        # 注意：在方案B中，我们需要一种新的令牌机制，暂时复用旧的
+        token = "placeholder_token"  # Placeholder
+        download_url = f"{settings.PROXY_BASE_URL}/files/internal/{sha256}/{token}:download"
+
+        # b. 指挥客户端上传
+        try:
             response_payload = await manager.proxy_request(
-                command_type="upload_chunk",
+                command_type="upload_from_url",
                 payload={
-                    "upload_url": session.real_upload_url,
-                    "chunk_download_url": chunk_download_url,
-                    "upload_command": upload_command,
-                    "upload_offset": upload_offset,
-                    "content_length": content_length,
+                    "download_url": download_url,
+                    "file_metadata": {
+                        "name": entry.original_filename,
+                        "displayName": entry.original_filename,
+                        "mimeType": entry.mime_type,
+                    },
                 },
                 request=request,
                 request_id=request_id,
+                client_id=client_id, # 需要改造 proxy_request 以接受指定 client_id
             )
+            gemini_file = response_payload.get("file")
+            if not gemini_file:
+                raise ApiException(status_code=500, detail="Frontend did not return a file object.")
 
-        # 处理响应
-        processed = file_manager.process_upload_response(session_id, response_payload)
+            # c. 更新元数据
+            file_manager.update_replication_status(
+                sha256, client_id, "synced", gemini_file
+            )
+            Logger.api_response(request_id, f"文件同步上传成功 | {client_id}")
+            return File.model_validate(gemini_file)
 
-        # 构造 HTTP 响应
-        response = Response(
-            status_code=processed["status"],
-            content=processed["content"],
-            headers=dict(processed["headers"]),
-        )
-
-        # 记录日志
-        log_detail = f"上传完成" if processed["is_final"] else f"块已接收"
-        Logger.api_response(request_id, log_detail)
-
-        return response
-    except ApiException as e:
-        raise HTTPException(status_code=e.status_code, detail=e.detail)
-    finally:
-        # 清理一次性令牌
-        file_manager.invalidate_chunk_download_token(token)
-
-
-@files_upload_router.get(
-    "/upload/v1beta/files/internal/{token}:download",
-    include_in_schema=False,
-)
-async def get_file_chunk(token: str):
-    """
-    Gets a temporary file chunk for upload to the frontend.
-    """
-    chunk_path = file_manager.consume_chunk_download_token(token)
-    if not chunk_path or not chunk_path.exists():
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chunk not found or token invalid.")
-
-    Logger.event("CHUNK_DOWNLOAD", "发送临时文件块给浏览器", token=token[:8])
-    return FileResponse(chunk_path, media_type="application/octet-stream")
+        except ApiException as e:
+            file_manager.update_replication_status(sha256, client_id, "failed")
+            raise HTTPException(status_code=e.status_code, detail=e.detail)
 
 
 # ============================================================================
-# 文件管理端点
+# 内部下载端点 (供 WebSocket 客户端使用)
+# ============================================================================
+
+
+@router.get(
+    "/files/internal/{sha256}/{token}:download",
+    include_in_schema=False,
+)
+async def internal_download_file(sha256: str, token: str):
+    """
+    供 WebSocket 客户端下载文件内容以进行上传。
+    TODO: 需要实现安全的令牌验证机制。
+    """
+    entry = file_manager.get_metadata_entry(sha256)
+    if not entry or not entry.local_path.exists():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found in cache.")
+
+    Logger.event("INTERNAL_DOWNLOAD", "客户端正在下载文件", sha256=sha256[:8])
+    return FileResponse(entry.local_path, media_type=entry.mime_type)
+
+
+# ============================================================================
+# 文件管理端点 (重构)
 # ============================================================================
 
 
@@ -197,47 +148,38 @@ async def get_file_chunk(token: str):
     "/files",
     response_model=ListFilesResponse,
     name="files.list",
-    response_model_exclude_none=True,
 )
 async def list_files(params: ListFilesPayload = Depends()):
-    """
-    Lists the metadata for Files owned by the requesting project.
-    """
-    request_id = str(uuid.uuid4())
-    Logger.api_request(request_id, f"列出文件 | 页大小: {params.page_size}")
-
-    files_response = file_manager.list_files(params.page_size, params.page_token)
-
-    Logger.api_response(request_id, f"{len(files_response.get('files', []))} 个文件")
-    return files_response
+    """从后端缓存中列出所有文件。"""
+    # TODO: 实现基于新元数据结构的分页逻辑
+    all_files = []
+    for entry in file_manager.metadata_store.values():
+        # 返回每个文件最新的一个有效副本
+        for data in entry.replication_map.values():
+            if data.get("status") == "synced":
+                all_files.append(File.model_validate(data))
+                break
+    return ListFilesResponse(files=all_files)
 
 
 @router.get(
     "/files/{name:path}",
-    name="files.get",
     response_model=File,
-    response_model_exclude_none=True,
+    name="files.get",
 )
-async def get_file(request: Request, name: str):
-    """
-    Gets the metadata for the given File.
-    """
-    request_id = str(uuid.uuid4())
-    Logger.api_request(request_id, f"获取文件 | {name}")
+async def get_file(name: str):
+    """从后端缓存中获取指定文件的元数据。"""
+    sha256 = file_manager.get_sha256_by_filename(name)
+    if not sha256:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found.")
+    
+    entry = file_manager.get_metadata_entry(sha256)
+    if entry:
+        for data in entry.replication_map.values():
+            if data.get("name") == name and data.get("status") == "synced":
+                return File.model_validate(data)
 
-    async with manager.monitored_proxy_request(request_id, request):
-        response_payload = await manager.proxy_request(
-            command_type="get_file",
-            payload={"file_name": name},
-            request=request,
-            request_id=request_id,
-        )
-
-    file_metadata = File.model_validate(response_payload)
-    file_manager.save_file_metadata(file_metadata)  # 更新缓存供 list_files 使用
-
-    Logger.api_response(request_id, f"文件: {name}")
-    return file_metadata
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found.")
 
 
 @router.delete(
@@ -247,26 +189,15 @@ async def get_file(request: Request, name: str):
 )
 async def delete_file(request: Request, name: str):
     """
-    Deletes the File.
+    删除文件缓存及其在所有 Gemini 客户端上的副本。
     """
-    request_id = str(uuid.uuid4())
-    Logger.api_request(request_id, f"删除文件 | {name}")
+    # TODO: 实现更复杂的删除逻辑
+    # 1. 找到 sha256
+    # 2. 指挥所有 synced 的客户端删除 Gemini 上的文件
+    # 3. 删除本地缓存和元数据
+    sha256 = file_manager.get_sha256_by_filename(name)
+    if sha256:
+        # 这是一个复杂操作，暂时只删除元数据
+        file_manager._delete_entry(sha256) # 使用内部方法清理
 
-    try:
-        async with manager.monitored_proxy_request(request_id, request):
-            await manager.proxy_request(
-                command_type="delete_file",
-                payload={"file_name": name},
-                request=request,
-                request_id=request_id,
-            )
-    except ApiException as e:
-        # 如果文件在 Gemini 侧已被删除（404），忽略错误
-        if e.status_code != 404:
-            raise HTTPException(status_code=e.status_code, detail=e.detail)
-
-    # 删除本地缓存（成功或 404 都删除）
-    file_manager.delete_file_metadata(name)
-
-    Logger.api_response(request_id, "删除成功")
     return Response(status_code=status.HTTP_204_NO_CONTENT)

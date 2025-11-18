@@ -47,6 +47,13 @@ class Settings(BaseSettings):
     SESSION_EXPIRATION_TIME: int = 3600  # 上传会话过期时间（秒）
     SESSION_CLEANUP_INTERVAL: int = 600  # 会话清理间隔（秒）
 
+    # ===========================
+    # 文件缓存配置 (方案 B)
+    # ===========================
+    FILE_CACHE_DIR: str = "./file_cache"  # 文件内容缓存目录
+    FILE_CACHE_QUOTA_MB: int = 1024  # 缓存配额（MB）
+    FILE_CACHE_CLEANUP_INTERVAL: int = 600  # 缓存清理任务间隔（秒）
+
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", case_sensitive=True, extra="ignore"  # 忽略未定义的环境变量
     )
@@ -71,10 +78,10 @@ class Settings(BaseSettings):
             raise ValueError(f"APP_ENV 必须是 {valid_envs} 之一")
         return v_lower
 
-    @field_validator("TEMP_CHUNKS_DIR")
+    @field_validator("TEMP_CHUNKS_DIR", "FILE_CACHE_DIR")
     @classmethod
-    def validate_temp_dir(cls, v: str) -> str:
-        """验证并创建临时目录"""
+    def validate_dirs(cls, v: str) -> str:
+        """验证并创建目录"""
         path = Path(v)
         if not path.exists():
             path.mkdir(parents=True, exist_ok=True)

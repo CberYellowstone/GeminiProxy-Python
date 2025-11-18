@@ -1,9 +1,9 @@
-import asyncio
 import logging
 from contextlib import asynccontextmanager
 
 from app.api import api_router
 from app.core import manager
+from app.core.background_tasks import start_background_tasks, stop_background_tasks
 from app.core.config import settings
 from app.core.exceptions import ApiException
 from app.core.file_manager import file_manager
@@ -21,11 +21,11 @@ Logger.event("STARTUP", "应用启动", env=settings.APP_ENV, log_level=settings
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    cleanup_task = asyncio.create_task(file_manager.periodic_cleanup_task())
+    await start_background_tasks()
     yield
     # Shutdown
-    cleanup_task.cancel()
-    file_manager.cleanup_all_temp_files()
+    await stop_background_tasks()
+    file_manager.cleanup_all_cache_files()
 
 
 app = FastAPI(
