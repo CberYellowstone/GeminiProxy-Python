@@ -53,6 +53,7 @@ class Settings(BaseSettings):
     FILE_CACHE_DIR: str = "../file_cache"  # 文件内容缓存目录 (移出 backend 目录以避免触发重载)
     FILE_CACHE_QUOTA_MB: int = 1024  # 缓存配额（MB）
     FILE_CACHE_CLEANUP_INTERVAL: int = 600  # 缓存清理任务间隔（秒）
+    REMOTE_DOWNLOAD_TIMEOUT: int = 600  # 远程文件下载超时时间（秒）
 
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", case_sensitive=True, extra="ignore"  # 忽略未定义的环境变量

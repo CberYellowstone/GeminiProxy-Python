@@ -5,3 +5,4 @@ pydantic
 python-dotenv
 rich
 pydantic_settings
+httpx
