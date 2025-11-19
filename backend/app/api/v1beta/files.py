@@ -6,6 +6,7 @@ from __future__ import annotations
 采用后端缓存策略。
 """
 
+import base64
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -137,6 +138,17 @@ def build_final_upload_response(file_data: File | dict) -> JSONResponse:
     )
 
 
+def encode_sha256_base64(sha256_hex: Optional[str]) -> Optional[str]:
+    """将十六进制 sha256 转换为 base64 字符串"""
+    if not sha256_hex:
+        return None
+    try:
+        return base64.b64encode(bytes.fromhex(sha256_hex)).decode("ascii")
+    except ValueError:
+        Logger.warning("无法转换 sha256 为 base64", sha256=sha256_hex)
+        return None
+
+
 def enforce_size_consistency(
     metadata: dict,
     actual_size: int,
@@ -208,6 +220,12 @@ def map_frontend_response_to_file_model(frontend_file: Optional[dict], entry, si
 
     # 构建符合File模型的数据
     fallback_name = f"files/{entry.sha256}"
+    sha_base64 = (
+        frontend_file.get("sha256Hash")
+        or frontend_file.get("sha256_hash")
+        or encode_sha256_base64(entry.sha256)
+        or entry.sha256
+    )
     mapped_file = {
         "name": frontend_file.get("name") or fallback_name,
         "displayName": entry.original_filename or "untitled",
@@ -215,7 +233,7 @@ def map_frontend_response_to_file_model(frontend_file: Optional[dict], entry, si
         "sizeBytes": str(frontend_file.get("size", size_bytes)),
         "createTime": now,
         "updateTime": now,
-        "sha256Hash": entry.sha256,
+        "sha256Hash": sha_base64,
         "uri": frontend_file.get("uri") or fallback_name,
         "state": "ACTIVE",  # 假设上传成功后状态为ACTIVE
         "source": "UPLOADED"
@@ -361,7 +379,7 @@ async def _process_cached_file_upload(
                     "sizeBytes": str(entry.size_bytes),
                     "createTime": datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
                     "updateTime": datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
-                    "sha256Hash": sha256,
+                    "sha256Hash": encode_sha256_base64(sha256) or sha256,
                     "uri": f"files/{sha256}",
                     "state": "ACTIVE",
                     "source": "UPLOADED",
@@ -401,8 +419,9 @@ async def create_file(
     初始化一个模拟的可续传上传会话。
     """
     session_id = str(uuid.uuid4())
+    metadata = body.file.model_dump(by_alias=True, exclude_none=True) if body and body.file else {}
     file_manager.upload_sessions[session_id] = {
-        "metadata": body.file.model_dump(by_alias=True, exclude_none=True),
+        "metadata": metadata,
         "created_at": datetime.now(timezone.utc),
     }
 
@@ -415,6 +434,45 @@ async def create_file(
             "X-Goog-Upload-Status": "active",
         },
     )
+
+
+@router.post(
+    "/files",
+    response_model=UploadFileResponse,
+    name="files.metadata_create_only",
+)
+async def create_file_metadata_only(
+    request: Request,
+    body: InitialUploadRequest = Body(...),
+):
+    """处理 metadata-only 文件创建请求"""
+    request_id = str(uuid.uuid4())
+    metadata = body.file.model_dump(by_alias=True, exclude_none=True) if body and body.file else {}
+    if not metadata:
+        raise HTTPException(status_code=400, detail="file metadata is required")
+
+    Logger.api_request(request_id, "文件 metadata-only 创建")
+    payload = {"metadata": {"file": metadata}}
+    async with manager.monitored_proxy_request(request_id, request) as client_id:
+        response_data = await manager.proxy_request(
+            command_type="create_file_metadata",
+            payload=payload,
+            request=request,
+            request_id=request_id,
+        )
+
+    remote_file = response_data.get("file") if isinstance(response_data, dict) else None
+    if not remote_file and isinstance(response_data, dict):
+        remote_file = response_data
+    if not isinstance(remote_file, dict):
+        raise HTTPException(status_code=502, detail="Invalid response from frontend client")
+
+    entry = file_manager.ensure_remote_entry(remote_file)
+    if entry:
+        file_manager.update_replication_status(entry.sha256, client_id, "synced", remote_file)
+
+    Logger.api_response(request_id, "metadata-only 文件创建成功")
+    return build_final_upload_response(remote_file)
 
 
 @router.post(
@@ -768,7 +826,7 @@ async def get_file(request: Request, name: str, verify_remote: bool = Query(Fals
 
 @router.delete(
     "/files/{name:path}",
-    status_code=status.HTTP_204_NO_CONTENT,
+    status_code=status.HTTP_200_OK,
     name="files.delete",
 )
 async def delete_file(request: Request, name: str):
@@ -782,12 +840,12 @@ async def delete_file(request: Request, name: str):
     if not sha256:
         # 如果文件在本地不存在，也直接返回成功，保持幂等性
         Logger.api_response(request_id, "文件在本地未找到，视为成功")
-        return Response(status_code=status.HTTP_204_NO_CONTENT)
+        return JSONResponse(status_code=status.HTTP_200_OK, content={})
 
     entry = file_manager.get_metadata_entry(sha256)
     if not entry:
         Logger.api_response(request_id, "文件在本地未找到，视为成功")
-        return Response(status_code=status.HTTP_204_NO_CONTENT)
+        return JSONResponse(status_code=status.HTTP_200_OK, content={})
 
     # 派发后台任务去删除所有远程副本
     for client_id, data in entry.replication_map.items():
@@ -801,4 +859,4 @@ async def delete_file(request: Request, name: str):
     file_manager._delete_entry(sha256)
 
     Logger.api_response(request_id, "本地文件已删除，远程删除任务已派发")
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+    return JSONResponse(status_code=status.HTTP_200_OK, content={})

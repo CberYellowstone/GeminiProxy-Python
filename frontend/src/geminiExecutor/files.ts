@@ -82,6 +82,26 @@ export async function initiateResumableUpload(
   return { upload_url: uploadUrl };
 }
 
+export async function createMetadataOnlyFile(
+  payload: CreateFilePayload,
+): Promise<any> {
+  const metadata = payload.metadata || {};
+  const response = await fetch(`${GOOGLE_API_URL}/files`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(metadata),
+  });
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ error: { message: response.statusText } }));
+    throw new ApiError(`Failed to create metadata-only file: ${error.error?.message || response.statusText}`, response.status, error);
+  }
+
+  return await response.json();
+}
+
 /**
  * Uploads a file chunk to the Google AI API.
  * @param payload - The payload from the backend command.

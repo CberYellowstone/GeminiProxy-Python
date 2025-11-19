@@ -1,6 +1,9 @@
 import { GoogleGenAI } from "@google/genai";
+import type { CreateFilePayload, DeleteFilePayload, GetFilePayload, UpdateFilePayload } from '../types/files';
+import type { generateContentCommand, StreamGenerateContentCommand } from '../types/generatingContent';
+import type { GetModelCommandPayload, ListModelsCommandPayload } from '../types/models';
 import type { Command } from '../types/types';
-import { deleteFile, getFile, initiateResumableUpload, uploadChunk } from "./files";
+import { createMetadataOnlyFile, deleteFile, getFile, initiateResumableUpload, uploadChunk } from "./files";
 import { executeGenerateContent, executeStreamGenerateContent } from "./generatingContent";
 import { executeGetModel, executeListModels } from './models';
 
@@ -26,28 +29,31 @@ export const geminiExecutor = {
   execute: async (command: Command, sendResponse: (payload: unknown) => void, backendUrl?: string): Promise<any> => {
     switch (command.type) {
       case 'listModels':
-        return executeListModels(command.payload);
+        return executeListModels(command.payload as ListModelsCommandPayload);
       case 'getModel':
-        return executeGetModel(command.payload);
+        return executeGetModel(command.payload as GetModelCommandPayload);
       case 'generateContent':
-        return executeGenerateContent(command, activeRequests);
+        return executeGenerateContent(command as generateContentCommand, activeRequests);
       case 'streamGenerateContent':
-        await executeStreamGenerateContent(command, sendResponse, activeRequests);
+        await executeStreamGenerateContent(command as StreamGenerateContentCommand, sendResponse, activeRequests);
         return;
       // File API Commands
       case 'createFile':
       case 'initiate_resumable_upload':
-        return initiateResumableUpload(command.payload);
+        return initiateResumableUpload(command.payload as CreateFilePayload);
+      case 'create_file_metadata':
+      case 'createFileMetadata':
+        return createMetadataOnlyFile(command.payload as CreateFilePayload);
       case 'updateFile':
       case 'upload_chunk':
       case 'upload_file_chunk':
-        return uploadChunk(command.payload, backendUrl);
+        return uploadChunk(command.payload as UpdateFilePayload, backendUrl);
       case 'getFile':
       case 'get_file':
-        return getFile(command.payload);
+        return getFile(command.payload as GetFilePayload);
       case 'deleteFile':
       case 'delete_file':
-        return deleteFile(command.payload);
+        return deleteFile(command.payload as DeleteFilePayload);
       default:
         const exhaustiveCheck: never = command;
         throw new Error(`Unsupported command type: ${(exhaustiveCheck as any).type}`);

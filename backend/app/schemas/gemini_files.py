@@ -126,7 +126,7 @@ class FileMetadata(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
 class InitialUploadRequest(BaseModel):
-    file: FileMetadata
+    file: Optional[FileMetadata] = None
 
 
 class UploadFromUrlRequest(BaseModel):

@@ -20,7 +20,7 @@ export interface CreateFilePayload {
     };
   };
 }
-export type CreateFileCommand = BaseFileCommand<'createFile' | 'initiate_resumable_upload', CreateFilePayload>;
+export type CreateFileCommand = BaseFileCommand<'createFile' | 'initiate_resumable_upload' | 'create_file_metadata' | 'createFileMetadata', CreateFilePayload>;
 
 /**
  * Command to upload a chunk of a file.
