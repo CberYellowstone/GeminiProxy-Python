@@ -6,3 +6,4 @@ class ApiException(Exception):
         self.status_code = status_code
         self.detail = detail
         self.sha256_to_reset: Optional[str] = None  # 用于携带需要重置的文件的sha256
+        self.is_resettable: bool = False  # 标记异常是否可以触发重置
