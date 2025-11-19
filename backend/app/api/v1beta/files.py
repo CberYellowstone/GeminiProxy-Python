@@ -42,7 +42,7 @@ from fastapi import (
     status,
 )
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 # ============================================================================
 # 路由器配置
@@ -252,6 +252,81 @@ def map_frontend_response_to_file_model(frontend_file: Optional[dict], entry, si
     return mapped_file
 
 
+async def _ensure_valid_remote_entry(
+    entry,
+    *,
+    request: Request,
+    request_id: str,
+) -> File:
+    """
+    Reuses an existing cached entry by verifying at least one remote replica.
+    If none of the replicas are valid, synchronously rebuilds the remote copy.
+    """
+    sha256 = entry.sha256
+    candidates: list[tuple[str, str]] = [
+        (client_id, data.get("name"))
+        for client_id, data in entry.replication_map.items()
+        if data.get("status") == "synced" and data.get("name")
+    ]
+
+    for client_id, remote_name in candidates:
+        remote_file, verify_client_id = await fetch_remote_file_metadata(
+            request,
+            remote_name,
+            request_id,
+            reason="dedup-verify",
+            preferred_client_id=client_id,
+        )
+        if remote_file:
+            file_manager.update_replication_status(
+                sha256,
+                verify_client_id or client_id,
+                "synced",
+                remote_file,
+            )
+            return File.model_validate(remote_file)
+
+    Logger.warning(
+        "缓存命中但没有可用的远端副本，开始同步重建",
+        sha256=sha256[:8],
+        request_id=request_id,
+    )
+
+    file_manager.reset_replication_map(sha256)
+    try:
+        gemini_file, client_id = await manager.upload_file_from_cache(sha256)
+        Logger.event(
+            "REUSE_REBUILD",
+            "缓存文件已重新上传",
+            sha256=sha256[:8],
+            client_id=client_id,
+        )
+        remote_file, verify_client_id = await fetch_remote_file_metadata(
+            request,
+            gemini_file.get("name"),
+            request_id,
+            reason="dedup-rebuild",
+            preferred_client_id=client_id,
+        )
+        final_file = remote_file or gemini_file
+        file_manager.update_replication_status(
+            sha256,
+            verify_client_id or client_id,
+            "synced",
+            final_file,
+        )
+        return File.model_validate(final_file)
+    except Exception as exc:
+        Logger.error(
+            "缓存文件重建失败，返回本地映射",
+            exc=exc,
+            sha256=sha256[:8],
+            request_id=request_id,
+        )
+        fallback_file = build_file_response(None, entry, entry.size_bytes)
+        return File.model_validate(fallback_file)
+
+
 async def _process_cached_file_upload(
     *,
     request: Request,
@@ -277,23 +352,12 @@ async def _process_cached_file_upload(
         entry = None
 
     if entry:
-        for data in entry.replication_map.values():
-            if data.get("status") == "synced" and "name" in data:
-                try:
-                    file_obj = File.model_validate(data)
-                    Logger.api_response(request_id, f"文件已存在 (sha256: {sha256[:8]})")
-                    if session_id:
-                        file_manager.upload_sessions.pop(session_id, None)
-                    return build_final_upload_response(file_obj)
-                except Exception as e:
-                    Logger.warning(f"复制数据不完整，跳过: {e}", request_id=request_id)
-                    continue
-
-        fallback_file = build_file_response(None, entry, entry.size_bytes)
-        Logger.api_response(request_id, f"文件已存在 (sha256: {sha256[:8]}) | 使用本地元数据")
+        resolved_file = await _ensure_valid_remote_entry(entry, request=request, request_id=request_id)
+        Logger.api_response(request_id, f"文件已存在 (sha256: {sha256[:8]})")
         if session_id:
             file_manager.upload_sessions.pop(session_id, None)
-        return build_final_upload_response(fallback_file)
+        file_manager.clear_deleted_flag(sha256)
+        return build_final_upload_response(resolved_file)
 
     normalized_hint = MimeUtils.normalize_filename(filename_hint)
     metadata_filename = MimeUtils.normalize_filename(
@@ -905,3 +969,101 @@ async def delete_file(request: Request, name: str):
     return JSONResponse(status_code=status.HTTP_200_OK, content={})
 
 
+@router.post("/debug/mock-expire", include_in_schema=False)
+def mock_expire(sha: str = Body(..., embed=True)):
+    """
+    将指定缓存条目的 gemini_file_expiration 回拨到过去，触发 TTL 清理。
+    仅用于本地调试。
+    """
+    entry = file_manager.get_metadata_entry(sha)
+    if not entry:
+        raise HTTPException(status_code=404, detail="cached entry not found")
+    entry.gemini_file_expiration = datetime.now(timezone.utc) - timedelta(minutes=1)
+    Logger.info("调试: 标记缓存条目为过期", sha256=sha[:8])
+    return {"ok": True, "sha": sha}
+
+
+class DebugDeleteRemoteRequest(BaseModel):
+    sha: str = Field(..., description="目标缓存条目的 sha256")
+    client_id: Optional[str] = Field(
+        default=None,
+        alias="clientId",
+        description="可选，指定由哪个前端客户端执行 delete_file，默认取第一个同步副本。",
+    )
+
+
+@router.post("/debug/delete-remote", include_in_schema=False)
+async def debug_delete_remote(payload: DebugDeleteRemoteRequest):
+    """
+    指挥某个前端客户端删除远端 Gemini 文件，但保留本地缓存，以模拟远端文件被删除/过期。
+    """
+    entry = file_manager.get_metadata_entry(payload.sha)
+    if not entry:
+        raise HTTPException(status_code=404, detail="cached entry not found")
+
+    candidates: list[tuple[str, str]] = []
+    for client_id, data in entry.replication_map.items():
+        if data.get("status") == "synced" and data.get("name"):
+            candidates.append((client_id, data["name"]))
+
+    if not candidates:
+        raise HTTPException(status_code=400, detail="no synced remote replicas to delete")
+
+    target_client: Optional[str] = None
+    target_name: Optional[str] = None
+    if payload.client_id:
+        for client_id, file_name in candidates:
+            if client_id == payload.client_id:
+                target_client, target_name = client_id, file_name
+                break
+        if not target_client:
+            raise HTTPException(
+                status_code=404,
+                detail=f"client {payload.client_id} does not have a synced replica for this file",
+            )
+    else:
+        target_client, target_name = candidates[0]
+
+    request_id = f"debug-delete-{payload.sha[:8]}"
+    Logger.info(
+        "调试: 指派前端删除远端文件以模拟过期",
+        sha256=payload.sha[:8],
+        client_id=target_client,
+        file_name=target_name,
+        request_id=request_id,
+    )
+
+    try:
+        await manager.send_command_to_client(
+            client_id=target_client,
+            command_type="delete_file",
+            payload={"file_name": target_name},
+            request_id=request_id,
+        )
+    except Exception as exc:
+        Logger.warning(
+            "调试远端删除失败",
+            sha256=payload.sha[:8],
+            client_id=target_client,
+            file_name=target_name,
+            exc=exc,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to delete remote file via client {target_client}: {exc}",
+        ) from exc
+
+    Logger.info(
+        "调试远端删除完成",
+        sha256=payload.sha[:8],
+        client_id=target_client,
+        file_name=target_name,
+        request_id=request_id,
+    )
+    return {
+        "ok": True,
+        "sha": payload.sha,
+        "client_id": target_client,
+        "file_name": target_name,
+        "note": "Local metadata untouched; next use should see Gemini 404 and trigger rebuild.",
+    }

@@ -100,7 +100,7 @@ const fixPayloadAsync = async (payload: any) => {
  */
 async function fetchWithRetry(url: string, options: RequestInit, signal: AbortSignal): Promise<Response> {
     let attempt = 0;
-    const maxRetries = 8; // Aggressive retry count for 500 errors
+    const maxRetries = 3; // Aggressive retry count for 500 errors
     
     while (true) {
         attempt++;

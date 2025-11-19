@@ -26,6 +26,7 @@ class FileReference:
     sha256: str
     entry: FileCacheEntry
     file_dict: dict
+    alias: Optional[str] = None
 
 
 class ConnectionManager:
@@ -40,6 +41,9 @@ class ConnectionManager:
 
         # 新增：追踪每个 client 正在处理的请求集合
         self.client_active_requests: dict[str, set[str]] = {}
+
+        # 请求与文件别名映射，用于错误回退
+        self.request_file_aliases: dict[str, dict[str, str]] = {}
 
         self._client_ids: list[str] = []
         self._next_client_index: int = 0
@@ -267,6 +271,16 @@ class ConnectionManager:
             if "not found" in error_message or "file not found" in error_message:
                 # 尝试从命令的 payload 中找到 file_name
                 file_name = command.get("payload", {}).get("fileName")
+                if not file_name and request_id in self.request_file_aliases:
+                    alias_map = self.request_file_aliases.get(request_id) or {}
+                    if len(alias_map) == 1:
+                        file_name = next(iter(alias_map.keys()))
+                    elif alias_map:
+                        Logger.warning(
+                            "无法确定具体缺失的文件，存在多个候选",
+                            request_id=request_id,
+                            aliases=list(alias_map.keys()),
+                        )
                 if file_name:
                     sha256 = file_manager.get_sha256_by_filename(file_name)
                     if sha256:
@@ -500,6 +514,17 @@ class ConnectionManager:
         file_refs: list[FileReference] = []
         try:
             file_refs = self._extract_file_references(effective_payload, request_id)
+            if not original_file_name and file_refs:
+                original_file_name = file_refs[0].alias
+            if file_refs:
+                alias_list = [
+                    ref.alias or ref.entry.replication_map.get("local", {}).get("name") or ref.sha256[:8]
+                    for ref in file_refs
+                ]
+                Logger.info(
+                    f"[调试] 共解析出 {len(file_refs)} 个文件引用: {alias_list}",
+                    request_id=request_id,
+                )
         except HTTPException:
             raise
         except Exception as exc:
@@ -522,7 +547,11 @@ class ConnectionManager:
 
                 client_id = best_client_id
 
-            self._rewrite_file_references(file_refs, client_id, request_id)
+            await self._ensure_remote_files_available(client_id, file_refs, request_id)
+            alias_map: dict[str, str] = {}
+            self._rewrite_file_references(file_refs, client_id, request_id, alias_map)
+            if alias_map:
+                self.request_file_aliases[request_id] = alias_map
 
         # 实际执行请求
         try:
@@ -533,18 +562,20 @@ class ConnectionManager:
             self.client_active_requests[client_id].add(request_id)
 
             try:
-                return await self.proxy_request(
+                result = await self.proxy_request(
                     command_type=command_type,
                     payload=effective_payload,
                     request=request,
                     request_id=request_id,
                     is_streaming=is_streaming,
                 )
+                return result
             finally:
                 # 清理请求映射
                 self.request_to_client.pop(request_id, None)
                 if client_id in self.client_active_requests:
                     self.client_active_requests[client_id].discard(request_id)
+                self.request_file_aliases.pop(request_id, None)
         except Exception as e:
             # 检查是否有可重置的错误
             if hasattr(e, 'is_resettable') and getattr(e, 'is_resettable', False):
@@ -723,15 +754,15 @@ class ConnectionManager:
 
         return SimpleNamespace(is_disconnected=_always_connected)
 
-    def _resolve_sha_from_file_dict(self, file_dict: dict) -> Optional[str]:
-        for key in ("fileUri", "file_uri", "fileName", "file_name"):
+    def _resolve_sha_from_file_dict(self, file_dict: dict) -> tuple[Optional[str], Optional[str]]:
+        for key in ("fileUri", "file_uri", "fileName", "file_name", "fileId", "file_id"):
             value = file_dict.get(key)
-            if not value:
+            if not value or not isinstance(value, str):
                 continue
             sha256 = file_manager.get_sha256_by_filename(value)
             if sha256:
-                return sha256
-        return None
+                return sha256, value
+        return None, None
 
     def _extract_file_references(self, payload: Any, request_id: str) -> list[FileReference]:
         """遍历 payload，收集所有 fileData 节点"""
@@ -741,7 +772,7 @@ class ConnectionManager:
             if isinstance(node, dict):
                 for key, value in node.items():
                     if key in ("fileData", "file_data") and isinstance(value, dict):
-                        sha256 = self._resolve_sha_from_file_dict(value)
+                        sha256, alias = self._resolve_sha_from_file_dict(value)
                         if not sha256:
                             Logger.warning("fileData 无法解析 sha256", request_id=request_id, file_data=value)
                             continue
@@ -751,7 +782,7 @@ class ConnectionManager:
                                 status_code=status.HTTP_404_NOT_FOUND,
                                 detail=f"File {value.get('fileName') or value.get('fileUri')} not found in cache.",
                             )
-                        references.append(FileReference(sha256=sha256, entry=entry, file_dict=value))
+                        references.append(FileReference(sha256=sha256, entry=entry, file_dict=value, alias=alias))
                     else:
                         _walk(value)
             elif isinstance(node, list):
@@ -812,7 +843,13 @@ class ConnectionManager:
 
         return selected, missing_map.get(selected, []), missing_map.get(preferred_client, [])
 
-    def _rewrite_file_references(self, file_refs: list[FileReference], client_id: str, request_id: str):
+    def _rewrite_file_references(
+        self,
+        file_refs: list[FileReference],
+        client_id: str,
+        request_id: str,
+        alias_map: Optional[dict[str, str]] = None,
+    ):
         """将 payload 中的 fileData 替换为客户端对应的 fileUri"""
         for ref in file_refs:
             replication_data = ref.entry.replication_map.get(client_id)
@@ -833,6 +870,14 @@ class ConnectionManager:
             ref.file_dict.pop("file_name", None)
             ref.file_dict.pop("file_uri", None)
 
+            if alias_map is not None:
+                if final_file_name:
+                    alias_map[final_file_name] = ref.sha256
+                if final_uri:
+                    alias_map[final_uri] = ref.sha256
+                if ref.alias:
+                    alias_map.setdefault(ref.alias, ref.sha256)
+
             # 记录使用，便于调试
             Logger.debug(
                 "已改写 fileData 引用",
@@ -841,6 +886,89 @@ class ConnectionManager:
                 sha256=ref.sha256,
                 file_uri=final_uri,
             )
+
+    async def _ensure_remote_files_available(
+        self,
+        client_id: str,
+        file_refs: list[FileReference],
+        request_id: str,
+    ):
+        """在发送请求前通过 get_file 校验所有引用是否仍然有效"""
+        checked: set[str] = set()
+        needs_heal: list[str] = []
+
+        for ref in file_refs:
+            if ref.sha256 in checked:
+                continue
+            checked.add(ref.sha256)
+
+            replication_data = ref.entry.replication_map.get(client_id)
+            if not replication_data or replication_data.get("status") != "synced":
+                continue
+            remote_name = replication_data.get("name")
+            if not remote_name:
+                continue
+
+            verify_request_id = f"{request_id}-verify-{ref.sha256[:8]}"
+            try:
+                response = await self.send_command_to_client(
+                    client_id=client_id,
+                    command_type="get_file",
+                    payload={"file_name": remote_name},
+                    request_id=verify_request_id,
+                )
+                remote_file = response.get("file") if isinstance(response, dict) else response
+                if isinstance(remote_file, dict):
+                    file_manager.update_replication_status(ref.sha256, client_id, "synced", remote_file)
+            except HTTPException as exc:
+                status_code = exc.status_code
+                if status_code == status.HTTP_404_NOT_FOUND or status_code >= status.HTTP_500_INTERNAL_SERVER_ERROR:
+                    Logger.warning(
+                        "远程文件校验失败，将触发重建",
+                        client_id=client_id,
+                        request_id=verify_request_id,
+                        sha256=ref.sha256[:8],
+                        status_code=status_code,
+                        detail=exc.detail,
+                    )
+                    needs_heal.append(ref.sha256)
+                else:
+                    raise
+            except ApiException as exc:
+                status_code = getattr(exc, "status_code", None) or status.HTTP_500_INTERNAL_SERVER_ERROR
+                if status_code == status.HTTP_404_NOT_FOUND or status_code >= status.HTTP_500_INTERNAL_SERVER_ERROR:
+                    Logger.warning(
+                        "前端报告远端文件无效，将触发重建",
+                        client_id=client_id,
+                        request_id=verify_request_id,
+                        sha256=ref.sha256[:8],
+                        status_code=status_code,
+                        detail=getattr(exc, "detail", None),
+                    )
+                    needs_heal.append(ref.sha256)
+                else:
+                    raise
+            except Exception as exc:
+                Logger.warning(
+                    "校验远端文件出现异常，将触发重建",
+                    exc=exc,
+                    client_id=client_id,
+                    request_id=verify_request_id,
+                    sha256=ref.sha256[:8],
+                )
+                needs_heal.append(ref.sha256)
+
+        if needs_heal:
+            dedup = list(dict.fromkeys(needs_heal))
+            Logger.warning(
+                "检测到已失效的远端文件，将触发同步复制",
+                client_id=client_id,
+                request_id=request_id,
+                files=[sha[:8] for sha in dedup],
+            )
+            for sha in dedup:
+                file_manager.reset_replication_map(sha)
+            await self._replicate_files_to_client(client_id, dedup, request_id)
 
     async def _upload_file_via_client(
         self,
