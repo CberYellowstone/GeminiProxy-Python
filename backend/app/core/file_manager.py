@@ -13,7 +13,7 @@ import shutil
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, AsyncGenerator, Dict, Optional, Tuple
+from typing import Any, AsyncGenerator, Dict, Optional, Set, Tuple
 import string
 
 from app.core.config import settings
@@ -86,6 +86,10 @@ class FileManager:
         self.upload_sessions: Dict[str, Any] = {}
         # 分块上传状态
         self.chunk_upload_states: Dict[str, ChunkUploadState] = {}
+        # 记录被显式删除的 sha256，防止异步删除期间被再次引用
+        self.deleted_shas: set[str] = set()
+        # 记录被删除的文件别名 (files/<id>、裸id 等) -> sha256
+        self.deleted_alias_map: Dict[str, str] = {}
 
         Logger.event("INIT", "文件管理器(方案 B)初始化", cache_dir=str(self.file_cache_dir))
 
@@ -235,7 +239,7 @@ class FileManager:
                 if tail and tail != normalized and self.reverse_mapping.pop(tail, None):
                     Logger.debug("移除文件别名", alias=tail)
 
-    def _extract_sha256_hex(self, remote_file: Dict[str, Any]) -> Optional[str]:
+    def extract_sha256_hex(self, remote_file: Dict[str, Any]) -> Optional[str]:
         """从远端文件响应中解析 sha256（支持 base64 或 hex 格式）"""
         sha_candidates = (
             remote_file.get("sha256Hash"),
@@ -261,7 +265,7 @@ class FileManager:
         """
         当本地不存在缓存条目时，根据远端 files.get 响应创建一个占位的元数据条目。
         """
-        sha256_hex = self._extract_sha256_hex(remote_file)
+        sha256_hex = self.extract_sha256_hex(remote_file)
         if not sha256_hex:
             Logger.warning("远程文件缺少 sha256Hash，无法登记", file_name=remote_file.get("name"))
             return None
@@ -493,6 +497,77 @@ class FileManager:
             Logger.error("删除缓存文件失败", exc=e, path=str(entry.local_path))
 
         Logger.event("FILE_CACHE_DELETE", "文件已从缓存中删除", sha256=sha256)
+
+    # ========================================================================
+    # 删除标记管理
+    # ========================================================================
+
+    def _normalize_aliases_for_tombstone(self, alias: Optional[str]) -> Set[str]:
+        """生成一组可用于 tombstone 的别名形式"""
+        if not alias:
+            return set()
+        normalized_aliases: Set[str] = set()
+        token = alias.strip()
+        if not token:
+            return normalized_aliases
+
+        def _add(value: str):
+            value = value.strip()
+            if value:
+                normalized_aliases.add(value)
+
+        _add(token)
+        if "files/" in token:
+            tail = token.split("files/", 1)[-1]
+            if tail and tail != token:
+                _add(tail)
+                _add(f"files/{tail}")
+        else:
+            _add(f"files/{token}")
+
+        return normalized_aliases
+
+    def mark_deleted(self, sha256: Optional[str], aliases: Optional[Set[str]] = None):
+        """记录一个 sha256 被显式删除，并记住相关别名"""
+        if not sha256:
+            return
+        self.deleted_shas.add(sha256)
+        tombstone_aliases: Set[str] = set()
+        tombstone_aliases.update(self._normalize_aliases_for_tombstone(sha256))
+        tombstone_aliases.update(self._normalize_aliases_for_tombstone(f"files/{sha256}"))
+        if aliases:
+            for alias in aliases:
+                tombstone_aliases.update(self._normalize_aliases_for_tombstone(alias))
+        for alias in tombstone_aliases:
+            self.deleted_alias_map[alias] = sha256
+        Logger.debug(
+            "标记文件为已删除",
+            sha256=sha256[:8],
+            aliases=list(sorted(tombstone_aliases))[:3],
+        )
+
+    def clear_deleted_flag(self, sha256: Optional[str]):
+        """清除显式删除标记"""
+        if not sha256:
+            return
+        if sha256 in self.deleted_shas:
+            self.deleted_shas.discard(sha256)
+        aliases_to_remove = [alias for alias, value in self.deleted_alias_map.items() if value == sha256]
+        for alias in aliases_to_remove:
+            self.deleted_alias_map.pop(alias, None)
+        if aliases_to_remove:
+            Logger.debug("清除已删除标记", sha256=sha256[:8], aliases=aliases_to_remove[:3])
+
+    def is_marked_deleted(self, sha256: Optional[str]) -> bool:
+        """判断一个 sha256 是否仍处于显式删除状态"""
+        return bool(sha256 and sha256 in self.deleted_shas)
+
+    def is_name_marked_deleted(self, name: Optional[str]) -> bool:
+        """判断一个文件名/URI 是否被标记为已删除"""
+        if not name:
+            return False
+        aliases = self._normalize_aliases_for_tombstone(name)
+        return any(alias in self.deleted_alias_map for alias in aliases)
 
     async def periodic_cleanup_task(self):
         """后台定期清理任务，结合 TTL 和 LRU 策略。"""

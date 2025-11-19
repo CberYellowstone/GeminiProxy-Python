@@ -267,6 +267,14 @@ async def _process_cached_file_upload(
     """共享的缓存文件上传处理逻辑"""
     metadata = metadata or {}
     entry = file_manager.get_metadata_entry(sha256)
+    if entry and file_manager.is_marked_deleted(sha256):
+        Logger.info(
+            "检测到已删除文件重新上传，正在重置旧的元数据",
+            sha256=sha256[:8],
+            request_id=request_id,
+        )
+        file_manager._delete_entry(sha256)
+        entry = None
 
     if entry:
         for data in entry.replication_map.values():
@@ -367,6 +375,7 @@ async def _process_cached_file_upload(
             file_manager.upload_sessions.pop(session_id, None)
 
         file_data = build_file_response(gemini_file, entry, size_bytes)
+        file_manager.clear_deleted_flag(sha256)
         return build_final_upload_response(file_data)
     except HTTPException as e:
         if e.status_code == 503:
@@ -391,6 +400,7 @@ async def _process_cached_file_upload(
                 if session_id:
                     file_manager.upload_sessions.pop(session_id, None)
 
+                file_manager.clear_deleted_flag(sha256)
                 return build_final_upload_response(local_file_data)
             except Exception as local_error:
                 Logger.error("创建本地文件条目失败", exc=local_error, request_id=request_id)
@@ -470,6 +480,7 @@ async def create_file_metadata_only(
     entry = file_manager.ensure_remote_entry(remote_file)
     if entry:
         file_manager.update_replication_status(entry.sha256, client_id, "synced", remote_file)
+        file_manager.clear_deleted_flag(entry.sha256)
 
     Logger.api_response(request_id, "metadata-only 文件创建成功")
     return build_final_upload_response(remote_file)
@@ -760,6 +771,8 @@ async def get_file(request: Request, name: str, verify_remote: bool = Query(Fals
     entry = file_manager.get_metadata_entry(sha256) if sha256 else None
 
     if not sha256 or not entry:
+        if file_manager.is_name_marked_deleted(name) or file_manager.is_marked_deleted(sha256):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found.")
         remote_file, verify_client_id = await fetch_remote_file_metadata(
             request,
             name,
@@ -767,6 +780,15 @@ async def get_file(request: Request, name: str, verify_remote: bool = Query(Fals
             reason="get-miss",
         )
         if remote_file:
+            remote_sha = file_manager.extract_sha256_hex(remote_file)
+            if file_manager.is_marked_deleted(remote_sha):
+                Logger.info(
+                    "请求访问已删除文件，忽略远程返回",
+                    request_id=request_id,
+                    file_name=name,
+                    sha256=(remote_sha[:8] if remote_sha else None),
+                )
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found.")
             remote_entry = file_manager.ensure_remote_entry(remote_file)
             if remote_entry:
                 file_manager.update_replication_status(
@@ -779,6 +801,8 @@ async def get_file(request: Request, name: str, verify_remote: bool = Query(Fals
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found.")
 
     if verify_remote:
+        if file_manager.is_marked_deleted(sha256):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found.")
         remote_file, verify_client_id = await fetch_remote_file_metadata(
             request,
             name,
@@ -811,6 +835,15 @@ async def get_file(request: Request, name: str, verify_remote: bool = Query(Fals
         reason="get-refresh",
     )
     if remote_file:
+        remote_sha = file_manager.extract_sha256_hex(remote_file)
+        if file_manager.is_marked_deleted(remote_sha):
+            Logger.info(
+                "刷新请求命中已删除文件，忽略远程返回",
+                request_id=request_id,
+                file_name=name,
+                sha256=(remote_sha[:8] if remote_sha else None),
+            )
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File not found.")
         remote_entry = file_manager.ensure_remote_entry(remote_file)
         if remote_entry:
             file_manager.update_replication_status(
@@ -842,7 +875,17 @@ async def delete_file(request: Request, name: str):
         Logger.api_response(request_id, "文件在本地未找到，视为成功")
         return JSONResponse(status_code=status.HTTP_200_OK, content={})
 
+    alias_candidates = {name}
     entry = file_manager.get_metadata_entry(sha256)
+    if entry:
+        for data in entry.replication_map.values():
+            remote_name = data.get("name")
+            if remote_name:
+                alias_candidates.add(remote_name)
+            uri = data.get("uri")
+            if uri:
+                alias_candidates.add(uri)
+    file_manager.mark_deleted(sha256, alias_candidates)
     if not entry:
         Logger.api_response(request_id, "文件在本地未找到，视为成功")
         return JSONResponse(status_code=status.HTTP_200_OK, content={})
@@ -860,3 +903,13 @@ async def delete_file(request: Request, name: str):
 
     Logger.api_response(request_id, "本地文件已删除，远程删除任务已派发")
     return JSONResponse(status_code=status.HTTP_200_OK, content={})
+
+
+
+@router.post("/debug/mock-expire")
+def mock_expire(sha: str = Body(..., embed=True)):
+    entry = file_manager.get_metadata_entry(sha)
+    if not entry:
+        raise HTTPException(status_code=404, detail="not found")
+    entry.gemini_file_expiration = datetime.now(timezone.utc) - timedelta(minutes=1)
+    return {"ok": True, "sha": sha}
