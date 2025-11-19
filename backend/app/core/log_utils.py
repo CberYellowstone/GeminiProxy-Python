@@ -4,6 +4,7 @@
 """
 
 import logging
+from typing import Optional
 
 from rich.logging import RichHandler
 
@@ -97,7 +98,7 @@ class Logger:
             logging.debug(f"  ← 响应数据: {debug_data}")
 
     @staticmethod
-    def ws_send(request_id: str, client_id: str, command_type: str | None = None, **debug_data):
+    def ws_send(request_id: str, client_id: str, command_type: Optional[str] = None, **debug_data):
         """
         WebSocket发送日志
 
@@ -121,7 +122,7 @@ class Logger:
         is_stream_start: bool = False,
         is_stream_end: bool = False,
         is_stream_middle: bool = False,
-        total_chunks: int | None = None,
+        total_chunks: Optional[int] = None,
         **debug_data,
     ):
         """
@@ -163,7 +164,7 @@ class Logger:
         logging.info(log_msg)
 
     @staticmethod
-    def error(message: str, exc: Exception | None = None, **context):
+    def error(message: str, exc: Optional[Exception] = None, **context):
         """错误日志（带异常栈）"""
         ctx = " | ".join(f"{k}: [yellow]{v}[/yellow]" for k, v in context.items())
         log_msg = f"[bold red]错误[/bold red] {message}"
@@ -176,20 +177,25 @@ class Logger:
             logging.error(log_msg)
 
     @staticmethod
-    def info(message: str):
-        """普通信息日志"""
-        logging.info(message)
+    def _format_context(context: dict) -> str:
+        """格式化上下文信息"""
+        if not context:
+            return ""
+        ctx = " | ".join(f"{k}: [cyan]{v}[/cyan]" for k, v in context.items())
+        return f" | {ctx}"
 
     @staticmethod
-    def debug(message: str):
+    def info(message: str, **context):
+        """普通信息日志"""
+        logging.info(f"{message}{Logger._format_context(context)}")
+
+    @staticmethod
+    def debug(message: str, **context):
         """调试日志"""
-        logging.debug(message)
+        logging.debug(f"{message}{Logger._format_context(context)}")
 
     @staticmethod
     def warning(message: str, **context):
         """警告日志"""
-        ctx = " | ".join(f"{k}: [yellow]{v}[/yellow]" for k, v in context.items())
-        log_msg = f"[bold orange]警告[/bold orange] {message}"
-        if ctx:
-            log_msg += f" | {ctx}"
+        log_msg = f"[bold orange]警告[/bold orange] {message}{Logger._format_context(context)}"
         logging.warning(log_msg)

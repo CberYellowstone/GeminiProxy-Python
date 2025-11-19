@@ -4,27 +4,27 @@ from .gemini_generate_content import Content, Tool, ToolConfig, UsageMetadata
 
 
 class CachedContent(BaseModel):
-    name: str | None = Field(None, description="Output only. Identifier. The resource name referring to the cached content.")
-    display_name: str | None = Field(
+    name: str = Field(None, description="Output only. Identifier. The resource name referring to the cached content.")
+    display_name: str = Field(
         None, alias="displayName", description="Optional. Immutable. The user-generated meaningful display name of the cached content."
     )
     model: str = Field(..., description="Required. Immutable. The name of the Model to use for cached content.")
-    contents: list[Content] | None = Field(None, description="Optional. Input only. Immutable. The content to cache.")
-    tools: list[Tool] | None = Field(
+    contents: list[Content] = Field(None, description="Optional. Input only. Immutable. The content to cache.")
+    tools: list[Tool] = Field(
         None, description="Optional. Input only. Immutable. A list of `Tools` the model may use to generate the next response."
     )
-    system_instruction: Content | None = Field(
+    system_instruction: Content = Field(
         None, alias="systemInstruction", description="Optional. Input only. Immutable. Developer set system instruction."
     )
-    tool_config: ToolConfig | None = Field(None, alias="toolConfig", description="Optional. Input only. Immutable. Tool config.")
-    create_time: str | None = Field(None, alias="createTime", description="Output only. Creation time of the cache entry.")
-    update_time: str | None = Field(None, alias="updateTime", description="Output only. When the cache entry was last updated in UTC time.")
-    expire_time: str | None = Field(None, alias="expireTime", description="Timestamp in UTC of when this resource is considered expired.")
-    ttl: str | None = Field(
+    tool_config: ToolConfig = Field(None, alias="toolConfig", description="Optional. Input only. Immutable. Tool config.")
+    create_time: str = Field(None, alias="createTime", description="Output only. Creation time of the cache entry.")
+    update_time: str = Field(None, alias="updateTime", description="Output only. When the cache entry was last updated in UTC time.")
+    expire_time: str = Field(None, alias="expireTime", description="Timestamp in UTC of when this resource is considered expired.")
+    ttl: str = Field(
         None,
         description="Input only. New TTL for this resource, input only.A duration in seconds with up to nine fractional digits, ending with 's'.",
     )
-    usage_metadata: UsageMetadata | None = Field(
+    usage_metadata: UsageMetadata = Field(
         None, alias="usageMetadata", description="Output only. Metadata on the usage of the cached content."
     )
 

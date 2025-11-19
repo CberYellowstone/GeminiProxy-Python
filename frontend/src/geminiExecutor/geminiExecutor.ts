@@ -7,7 +7,7 @@ import { executeGetModel, executeListModels } from './models';
 export const GOOGLE_API_URL = "https://generativelanguage.googleapis.com/v1beta";
 export const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || "" });
 
-// 新增：管理活跃请求的 AbortController
+// Manages active requests for cancellation
 const activeRequests = new Map<string, AbortController>();
 
 async function testGeminiConnection(): Promise<string> {
@@ -23,7 +23,7 @@ async function testGeminiConnection(): Promise<string> {
 }
 
 export const geminiExecutor = {
-  execute: async (command: Command, sendResponse: (payload: unknown) => void): Promise<any> => {
+  execute: async (command: Command, sendResponse: (payload: unknown) => void, backendUrl?: string): Promise<any> => {
     switch (command.type) {
       case 'listModels':
         return executeListModels(command.payload);
@@ -35,12 +35,17 @@ export const geminiExecutor = {
         await executeStreamGenerateContent(command, sendResponse, activeRequests);
         return;
       // File API Commands
+      case 'createFile':
       case 'initiate_resumable_upload':
         return initiateResumableUpload(command.payload);
+      case 'updateFile':
       case 'upload_chunk':
-        return uploadChunk(command.payload);
+      case 'upload_file_chunk':
+        return uploadChunk(command.payload, backendUrl);
+      case 'getFile':
       case 'get_file':
         return getFile(command.payload);
+      case 'deleteFile':
       case 'delete_file':
         return deleteFile(command.payload);
       default:
@@ -49,7 +54,7 @@ export const geminiExecutor = {
     }
   },
   
-  // 新增：取消执行方法
+  // Cancel execution method
   cancelExecution: (requestId: string): boolean => {
     const controller = activeRequests.get(requestId);
     if (controller) {
@@ -65,5 +70,5 @@ export const geminiExecutor = {
   testGeminiConnection,
 };
 
-// 导出 activeRequests 供测试使用
+// Export activeRequests for testing
 export { activeRequests };

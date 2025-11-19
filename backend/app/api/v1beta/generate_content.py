@@ -1,5 +1,3 @@
-import logging
-import uuid
 from typing import Annotated
 
 from app.core import manager
@@ -26,17 +24,14 @@ async def generate_content(
     """
     Generates a model response given an input GenerateContentRequest. Refer to the text generation guide for detailed usage information. Input capabilities differ between models, including tuned models. Refer to the model guide and tuning guide for details.
     """
-    request_id = str(uuid.uuid4())
-    Logger.api_request(request_id, f"生成内容 | {model}")
-    async with manager.monitored_proxy_request(request_id, request):
-        response_data = await manager.proxy_request(
-            command_type="generateContent",
-            payload={"model": model, "payload": payload.model_dump(by_alias=True, exclude_none=True)},
-            request=request,
-            request_id=request_id,
-            is_streaming=False,
-        )
-    Logger.api_response(request_id, "生成完成")
+    Logger.api_request(None, f"生成内容 | {model}")
+    response_data = await manager.handle_api_request(
+        command_type="generateContent",
+        payload={"model": model, "payload": payload.model_dump(by_alias=True, exclude_none=True)},
+        request=request,
+        is_streaming=False,
+    )
+    Logger.api_response(None, "生成完成")
     return response_data
 
 
@@ -53,23 +48,17 @@ async def stream_generate_content(
     """
     Generates a streamed response from the model given an input GenerateContentRequest.
     """
-    request_id = str(uuid.uuid4())
-    Logger.api_request(request_id, f"流式生成 | {model}")
+    Logger.api_request(None, f"流式生成 | {model}")
 
     async def generator():
-        try:
-            async with manager.monitored_proxy_request(request_id, request):
-                response_generator = await manager.proxy_request(
-                    command_type="streamGenerateContent",
-                    payload={"model": model, "payload": payload.model_dump(by_alias=True, exclude_none=True)},
-                    request=request,
-                    request_id=request_id,
-                    is_streaming=True,
-                )
-                async for chunk in response_generator:
-                    yield chunk
-        finally:
-            # 流式传输完成后记录日志
-            Logger.api_response(request_id, "流式生成完成")
+        response_generator = await manager.handle_api_request(
+            command_type="streamGenerateContent",
+            payload={"model": model, "payload": payload.model_dump(by_alias=True, exclude_none=True)},
+            request=request,
+            is_streaming=True,
+        )
+        async for chunk in response_generator:
+            yield chunk
+        Logger.api_response(None, "流式生成完成")
 
     return StreamingResponse(generator())

@@ -1,6 +1,6 @@
 from fastapi import APIRouter
 
-from .files import router as files_router
+from .files import router as files_router, upload_router
 from .generate_content import router as generate_content_router
 from .models import router as models_router
 
