@@ -905,11 +905,3 @@ async def delete_file(request: Request, name: str):
     return JSONResponse(status_code=status.HTTP_200_OK, content={})
 
 
-
-@router.post("/debug/mock-expire")
-def mock_expire(sha: str = Body(..., embed=True)):
-    entry = file_manager.get_metadata_entry(sha)
-    if not entry:
-        raise HTTPException(status_code=404, detail="not found")
-    entry.gemini_file_expiration = datetime.now(timezone.utc) - timedelta(minutes=1)
-    return {"ok": True, "sha": sha}
