@@ -42,7 +42,7 @@ from fastapi import (
     status,
 )
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import ValidationError
 
 # ============================================================================
 # 路由器配置
@@ -967,103 +967,3 @@ async def delete_file(request: Request, name: str):
 
     Logger.api_response(request_id, "本地文件已删除，远程删除任务已派发")
     return JSONResponse(status_code=status.HTTP_200_OK, content={})
-
-
-@router.post("/debug/mock-expire", include_in_schema=False)
-def mock_expire(sha: str = Body(..., embed=True)):
-    """
-    将指定缓存条目的 gemini_file_expiration 回拨到过去，触发 TTL 清理。
-    仅用于本地调试。
-    """
-    entry = file_manager.get_metadata_entry(sha)
-    if not entry:
-        raise HTTPException(status_code=404, detail="cached entry not found")
-    entry.gemini_file_expiration = datetime.now(timezone.utc) - timedelta(minutes=1)
-    Logger.info("调试: 标记缓存条目为过期", sha256=sha[:8])
-    return {"ok": True, "sha": sha}
-
-
-class DebugDeleteRemoteRequest(BaseModel):
-    sha: str = Field(..., description="目标缓存条目的 sha256")
-    client_id: Optional[str] = Field(
-        default=None,
-        alias="clientId",
-        description="可选，指定由哪个前端客户端执行 delete_file，默认取第一个同步副本。",
-    )
-
-
-@router.post("/debug/delete-remote", include_in_schema=False)
-async def debug_delete_remote(payload: DebugDeleteRemoteRequest):
-    """
-    指挥某个前端客户端删除远端 Gemini 文件，但保留本地缓存，以模拟远端文件被删除/过期。
-    """
-    entry = file_manager.get_metadata_entry(payload.sha)
-    if not entry:
-        raise HTTPException(status_code=404, detail="cached entry not found")
-
-    candidates: list[tuple[str, str]] = []
-    for client_id, data in entry.replication_map.items():
-        if data.get("status") == "synced" and data.get("name"):
-            candidates.append((client_id, data["name"]))
-
-    if not candidates:
-        raise HTTPException(status_code=400, detail="no synced remote replicas to delete")
-
-    target_client: Optional[str] = None
-    target_name: Optional[str] = None
-    if payload.client_id:
-        for client_id, file_name in candidates:
-            if client_id == payload.client_id:
-                target_client, target_name = client_id, file_name
-                break
-        if not target_client:
-            raise HTTPException(
-                status_code=404,
-                detail=f"client {payload.client_id} does not have a synced replica for this file",
-            )
-    else:
-        target_client, target_name = candidates[0]
-
-    request_id = f"debug-delete-{payload.sha[:8]}"
-    Logger.info(
-        "调试: 指派前端删除远端文件以模拟过期",
-        sha256=payload.sha[:8],
-        client_id=target_client,
-        file_name=target_name,
-        request_id=request_id,
-    )
-
-    try:
-        await manager.send_command_to_client(
-            client_id=target_client,
-            command_type="delete_file",
-            payload={"file_name": target_name},
-            request_id=request_id,
-        )
-    except Exception as exc:
-        Logger.warning(
-            "调试远端删除失败",
-            sha256=payload.sha[:8],
-            client_id=target_client,
-            file_name=target_name,
-            exc=exc,
-        )
-        raise HTTPException(
-            status_code=502,
-            detail=f"Failed to delete remote file via client {target_client}: {exc}",
-        ) from exc
-
-    Logger.info(
-        "调试远端删除完成",
-        sha256=payload.sha[:8],
-        client_id=target_client,
-        file_name=target_name,
-        request_id=request_id,
-    )
-    return {
-        "ok": True,
-        "sha": payload.sha,
-        "client_id": target_client,
-        "file_name": target_name,
-        "note": "Local metadata untouched; next use should see Gemini 404 and trigger rebuild.",
-    }
